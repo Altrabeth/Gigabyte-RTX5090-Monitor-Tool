@@ -16,9 +16,12 @@
 pub mod carousel;
 pub mod daemon;
 pub mod dashboard;
+pub mod gif;
+pub mod image;
 pub mod mode;
 pub mod off;
 pub mod on;
 pub mod probe;
 pub mod save;
 pub mod status;
+pub mod upload;

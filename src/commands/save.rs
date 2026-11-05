@@ -22,7 +22,8 @@ pub fn run(_args: Args, globals: &crate::Globals) -> Result<()> {
     Panel::new(session).save()
 }
 
-fn notice<T, W>(session: &Session<T, W>) -> &'static str {
+/// What a save is about to do, in the terms of this session.
+pub fn notice<T, W>(session: &Session<T, W>) -> &'static str {
     match session {
         Session::Live(_) => SAVING,
         Session::DryRun(_) => WOULD_SAVE,

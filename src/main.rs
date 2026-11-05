@@ -62,6 +62,10 @@ enum Command {
     Carousel(commands::carousel::Args),
     /// Keep the panel's sensor feed running
     Daemon(commands::daemon::Args),
+    /// Play an animated GIF
+    Gif(commands::gif::Args),
+    /// Show an image
+    Image(commands::image::Args),
     /// Select the display mode
     Mode(commands::mode::Args),
     /// Turn the panel off
@@ -85,6 +89,8 @@ fn run(cli: Cli) -> Result<()> {
         Command::Dashboard(args) => commands::dashboard::run(args, &cli.globals),
         Command::Carousel(args) => commands::carousel::run(args, &cli.globals),
         Command::Daemon(args) => commands::daemon::run(args, &cli.globals),
+        Command::Gif(args) => commands::gif::run(args, &cli.globals),
+        Command::Image(args) => commands::image::run(args, &cli.globals),
         Command::Mode(args) => commands::mode::run(args, &cli.globals),
         Command::Off(args) => commands::off::run(args, &cli.globals),
         Command::On(args) => commands::on::run(args, &cli.globals),

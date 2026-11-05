@@ -406,6 +406,29 @@ impl<T: Transport> Panel<T> {
     }
 }
 
+/// The total of the pauses [`Panel::upload`] will make, the firmware's pacing and
+/// nothing else, so a real upload takes longer by its time on the bus.
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] for a payload [`build_upload`] refuses.
+pub fn estimated_upload_pauses(
+    payload: &[u8],
+    params: &UploadParams,
+    options: UploadOptions,
+) -> Result<Duration> {
+    let frames = build_upload(payload, params)?;
+    let pacing: Duration = frames
+        .iter()
+        .map(|frame| pace_after(frame.kind, options.chunk_delay))
+        .sum();
+    if options.switch_mode && params.framebuffer == Framebuffer::Gif {
+        Ok(pacing + GIF_MODE_SETTLE)
+    } else {
+        Ok(pacing)
+    }
+}
+
 /// The mode that shows what a framebuffer holds. Both references only ever pair
 /// them this way.
 const fn mode_showing(framebuffer: Framebuffer) -> Mode {
@@ -948,6 +971,46 @@ mod tests {
         assert_eq!(mock.writes().len(), 430);
         let total: Duration = sleep.delays.iter().sum();
         assert_eq!(total, Duration::from_millis(5770));
+    }
+
+    #[test]
+    fn the_estimate_is_the_pauses_of_the_upload() {
+        let default = UploadOptions::default();
+        let cases = [
+            (image(), default),
+            (text(), default),
+            (gif(), default),
+            (
+                gif(),
+                UploadOptions {
+                    switch_mode: false,
+                    ..default
+                },
+            ),
+            (
+                image(),
+                UploadOptions {
+                    chunk_delay: Duration::from_millis(3),
+                    ..default
+                },
+            ),
+        ];
+        for (params, options) in cases {
+            let payload = [0x12; 1000];
+            let (mut panel, _mock) = panel();
+            let mut sleep = RecordingSleep::default();
+
+            panel
+                .upload(&payload, &params, options, &mut sleep, |_| {})
+                .unwrap();
+
+            let total: Duration = sleep.delays.iter().sum();
+            assert_eq!(
+                estimated_upload_pauses(&payload, &params, options).unwrap(),
+                total,
+                "{params:?}, {options:?}"
+            );
+        }
     }
 
     #[test]
