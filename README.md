@@ -148,11 +148,13 @@ aorus-lcd-rs/
 │   ├── bus/           # discovery.rs, transport.rs (raw I2C), lock.rs (flock)
 │   ├── protocol.rs    # pure frame builders (no I/O), opcodes, enums
 │   ├── panel.rs       # high-level ops: probe, on/off, mode, upload, save
-│   ├── image.rs       # resize to 320x170, RGB565 conversion, text render
+│   ├── image.rs       # resize to 320x170, RGB565 conversion
+│   ├── text.rs        # text render in the embedded font
 │   ├── rle.rs         # RLE encoder + GIF payload builder
 │   ├── sensors.rs     # NVML polling -> E3 values
 │   ├── session.rs     # the write gate: adapter, lock, device, EB 03 probe
 │   └── daemon.rs      # 1 Hz loop, signal handling, reconnect
+├── assets/            # the embedded font and its licence
 ├── tests/             # byte-parity tests against vectors from aorus_lcd.py
 └── dist/
     ├── aorus-lcd.service
@@ -174,7 +176,7 @@ Design rules:
 
 Suggested crates: `clap`, `anyhow`/`thiserror`, `i2cdev` or `nix` (ioctls),
 `nvml-wrapper` (loads `libnvidia-ml.so` from `nvidia-utils`), `image`, `gif`,
-`ab_glyph` or `fontdue` (text), `signal-hook`, `fs4` or `rustix` (flock), `toml`/`serde`
+`fontdue` (text), `signal-hook`, `fs4` or `rustix` (flock), `toml`/`serde`
 (config).
 
 ### CLI sketch
@@ -191,6 +193,9 @@ aorus-lcd daemon [--config /etc/aorus-lcd.toml]
 aorus-lcd save
 global: --bus N  --dry-run  -v
 ```
+
+`text` sends `AA` after the upload to start the rainbow effect, and that same frame saves
+the panel configuration to NVRAM. It prints a notice first; `--no-effect` leaves both out.
 
 ---
 
@@ -298,4 +303,8 @@ Protocol reverse engineering: [albancreton/aorus-master-linux](https://github.co
 This project is a clean reimplementation using protocol facts only; no vendor code.
 Not affiliated with Gigabyte or NVIDIA.
 
-License: MIT.
+The `text` command embeds [DejaVu Sans Bold](https://dejavu-fonts.github.io/) 2.37, under
+the Bitstream Vera and Arev font licences (the DejaVu changes are in the public domain).
+See [`assets/DejaVuSans-Bold.LICENSE`](assets/DejaVuSans-Bold.LICENSE).
+
+License: MIT, except the font above.
