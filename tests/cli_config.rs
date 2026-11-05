@@ -58,7 +58,9 @@ fn assert_refused(output: &Output, expected: &str) {
 
 #[test]
 fn the_file_sets_what_the_options_set() {
-    let text = "widgets = \"fps\"\ninterval = 9\nframe_bytes = 128\nfeed = \"adaptive\"\n";
+    // The steady feed, because adaptive sends nothing on its first ticks when the
+    // GPU is busy, and a dry-run reads the real sensors.
+    let text = "widgets = \"fps\"\ninterval = 9\nframe_bytes = 128\nfeed = \"steady\"\n";
 
     let output = with_config(text, &[]);
 
@@ -71,13 +73,22 @@ fn the_file_sets_what_the_options_set() {
         "--frame-bytes",
         "128",
         "--feed",
-        "adaptive",
+        "steady",
     ];
     assert_eq!(
         setup_frames(&output),
         setup_frames(&dry_run(None, &options))
     );
     assert!(setup_frames(&output).ends_with("(128 bytes)"));
+}
+
+/// Whether a tick sends anything under this feed depends on the live GPU load,
+/// so this asserts only that the file is accepted.
+#[test]
+fn the_file_can_choose_the_adaptive_feed() {
+    let output = with_config("feed = \"adaptive\"\n", &[]);
+
+    assert!(output.status.success(), "{output:?}");
 }
 
 #[test]
