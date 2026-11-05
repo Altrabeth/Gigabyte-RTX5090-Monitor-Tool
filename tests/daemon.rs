@@ -6,18 +6,21 @@
 //! and the lock path are replaced, and nothing here opens a device.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use aorus_lcd::bus::lock::BusLock;
 use aorus_lcd::bus::transport::{DryRun, Transport};
 use aorus_lcd::daemon::{
-    run_with, Clock, DaemonConfig, Environment, UntilStopped, POLL_SLICE, WRITE_ATTEMPTS,
+    run_with, Clock, DaemonConfig, Environment, FeedStrategy, UntilStopped, ADAPTIVE_BUSY_PERCENT,
+    ADAPTIVE_PAIR_GAP_TICKS, ADAPTIVE_WINDOW_POLLS, POLL_SLICE, WRITE_ATTEMPTS,
+    WRITE_COST_REPORT_TICKS,
 };
 use aorus_lcd::panel::Sleep;
 use aorus_lcd::protocol::{
@@ -28,6 +31,7 @@ use aorus_lcd::protocol::{
 use aorus_lcd::sensors::{FakeSensors, SensorSource};
 use aorus_lcd::session::{self, connect_with, Options, Session};
 use aorus_lcd::{Error, Result};
+use log::{Level, Log, Metadata, Record};
 use rustix::io::Errno;
 use tempfile::TempDir;
 
@@ -557,7 +561,7 @@ fn assert_allowed_frames(trace: &[Sent], config: DaemonConfig) {
                 configured = sent.ok;
             }
             FEED => {
-                assert_eq!(sent.frame.len(), FeedFrameLen::Full.bytes());
+                assert_eq!(sent.frame.len(), config.feed.bytes());
                 assert!(configured, "E3 before the panel was ready: {sent:?}");
                 read_back = None;
             }
@@ -1375,6 +1379,18 @@ fn zero_ticks_touches_nothing() {
 // failing sensors, a jump in time and a lost device. Whatever the order, the wire
 // only ever sees EB 03, DF, at most one E1 per connection, and E3.
 fn run_through_everything(rig: &Rig, config: DaemonConfig) {
+    run_through_everything_at(rig, config, SAMPLE, 4, 100);
+}
+
+/// [`run_through_everything`] on sensors reading `sample`. A sparse feed writes
+/// less, so it meets fewer of the faults and needs other bounds on the outcome.
+fn run_through_everything_at(
+    rig: &Rig,
+    config: DaemonConfig,
+    sample: SensorSample,
+    min_connections: usize,
+    min_frames: usize,
+) {
     rig.outage(3500, 9000);
     rig.fault(20_500, 30_500, Some(FEED), eio);
     rig.read_fault(30_000, 32_000, READ_BACK, short_read);
@@ -1391,7 +1407,10 @@ fn run_through_everything(rig: &Rig, config: DaemonConfig) {
     rig.run_configured(config, move |_| {
         opens.set(opens.get() + 1);
         if opens.get() % 3 == 0 {
-            Ok(healthy_sensors())
+            Ok(FakeSensors {
+                sample,
+                ..FakeSensors::default()
+            })
         } else {
             Ok(broken_sensors())
         }
@@ -1402,11 +1421,11 @@ fn run_through_everything(rig: &Rig, config: DaemonConfig) {
     assert_allowed_frames(&trace, config);
     let connections = rig.delivered(READ_BACK).len();
     assert!(
-        connections >= 4,
+        connections >= min_connections,
         "only {connections} connections: {trace:?}"
     );
-    assert!(rig.delivered(FEED).len() > 100);
     let feed = rig.delivered(FEED);
+    assert!(feed.len() > min_frames, "only {} frames", feed.len());
     assert!(
         feed.windows(2).all(|pair| pair[1] - pair[0] >= 1000),
         "frames closer than a tick: {feed:?}"
@@ -1460,6 +1479,623 @@ fn no_forbidden_frame_when_each_connection_needs_e1() {
         rig.delivered(DASHBOARD).len() < answered,
         "the failed E1 was not hit: {trace:?}"
     );
+}
+
+const BOTH_LENGTHS: [FeedFrameLen; 2] = [FeedFrameLen::Full, FeedFrameLen::Truncated];
+
+/// Serves one sample per poll, and the last one from then on. Clones share the
+/// list, so a reopened source carries on where the last one stopped.
+#[derive(Clone)]
+struct Polls(Rc<RefCell<VecDeque<SensorSample>>>);
+
+impl Polls {
+    fn of(samples: &[SensorSample]) -> Self {
+        Self(Rc::new(RefCell::new(samples.iter().copied().collect())))
+    }
+}
+
+impl SensorSource for Polls {
+    fn read(&mut self) -> Result<SensorSample> {
+        let mut samples = self.0.borrow_mut();
+        let sample = samples[0];
+        if samples.len() > 1 {
+            samples.pop_front();
+        }
+        Ok(sample)
+    }
+}
+
+/// [`SAMPLE`] at `usage` percent.
+fn at_usage(usage: u32) -> SensorSample {
+    SensorSample {
+        gpu_usage_percent: usage,
+        ..SAMPLE
+    }
+}
+
+fn adaptive(ticks: Option<u64>, feed: FeedFrameLen) -> DaemonConfig {
+    DaemonConfig {
+        feed,
+        strategy: FeedStrategy::Adaptive,
+        max_ticks: ticks,
+        ..DaemonConfig::default()
+    }
+}
+
+/// Runs `config` on sensors reading `samples`, one per poll.
+fn run_on(rig: &Rig, config: DaemonConfig, samples: &[SensorSample]) {
+    let polls = Polls::of(samples);
+    rig.run_configured(config, |_| Ok(polls.clone())).unwrap();
+}
+
+/// Adaptive at 256 bytes, always under load, for `ticks` polls.
+fn run_under_load(rig: &Rig, ticks: u64) {
+    let config = adaptive(Some(ticks), FeedFrameLen::Full);
+    run_on(rig, config, &[at_usage(90)]);
+}
+
+fn frames_of(samples: &[SensorSample], feed: FeedFrameLen) -> Vec<Vec<u8>> {
+    let frame = |sample| sensor_frame(sample, feed);
+    samples.iter().map(frame).collect()
+}
+
+#[test]
+fn the_adaptive_constants_are_the_ones_upstream_measured_with() {
+    assert_eq!(ADAPTIVE_BUSY_PERCENT, 50);
+    assert_eq!(ADAPTIVE_WINDOW_POLLS, 5);
+    assert_eq!(ADAPTIVE_PAIR_GAP_TICKS, 1);
+}
+
+#[test]
+fn steady_sends_every_tick_at_either_length_whatever_the_load() {
+    for feed in BOTH_LENGTHS {
+        let rig = Rig::new();
+        let samples = [at_usage(100), at_usage(0), at_usage(50), at_usage(99)];
+        let config = DaemonConfig {
+            feed,
+            max_ticks: Some(4),
+            ..DaemonConfig::default()
+        };
+
+        run_on(&rig, config, &samples);
+
+        assert_eq!(rig.delivered(FEED), [0, 1000, 2000, 3000]);
+        assert_eq!(rig.feed_frames(), frames_of(&samples, feed));
+        assert_allowed_frames(&rig.trace(), config);
+    }
+}
+
+#[test]
+fn adaptive_under_the_threshold_sends_like_steady_at_either_length() {
+    for feed in BOTH_LENGTHS {
+        let rig = Rig::new();
+        let samples = [at_usage(0), at_usage(49), at_usage(12), at_usage(49)];
+        let config = adaptive(Some(4), feed);
+
+        run_on(&rig, config, &samples);
+
+        assert_eq!(rig.delivered(FEED), [0, 1000, 2000, 3000]);
+        assert_eq!(rig.feed_frames(), frames_of(&samples, feed));
+        assert_allowed_frames(&rig.trace(), config);
+    }
+}
+
+#[test]
+fn adaptive_at_the_threshold_sends_each_summary_twice_a_second_apart_at_either_length() {
+    for feed in BOTH_LENGTHS {
+        let rig = Rig::new();
+        let config = adaptive(Some(18), feed);
+
+        run_on(&rig, config, &[at_usage(50)]);
+
+        assert_eq!(
+            rig.delivered(FEED),
+            [4000, 5000, 10_000, 11_000, 16_000, 17_000]
+        );
+        assert_eq!(rig.feed_frames(), frames_of(&[at_usage(50); 6], feed));
+        assert_allowed_frames(&rig.trace(), config);
+    }
+}
+
+#[test]
+fn each_summary_covers_its_own_window() {
+    let poll = |temp, clock, usage, fan, ram_clock, ram, power| SensorSample {
+        gpu_temp_c: temp,
+        gpu_clock_mhz: clock,
+        gpu_usage_percent: usage,
+        fan_speed: fan,
+        ram_clock_mhz: ram_clock,
+        ram_usage_percent: ram,
+        fps: 77,
+        tgp_watts: power,
+    };
+    let polls = [
+        // The first window.
+        poll(60, 2000, 60, 1000, 14_000, 30, 300),
+        poll(70, 2100, 70, 1400, 14_000, 31, 500),
+        poll(65, 2200, 80, 1200, 14_100, 32, 400),
+        poll(64, 2300, 90, 1100, 14_100, 33, 350),
+        poll(63, 2400, 100, 1050, 14_300, 34, 320),
+        // Between the frames of the pair, so in no window.
+        poll(99, 9999, 100, 9999, 9999, 99, 999),
+        // The second window.
+        poll(50, 1000, 55, 800, 10_000, 40, 200),
+        poll(51, 1000, 55, 800, 10_000, 41, 200),
+        poll(52, 1000, 55, 800, 10_000, 42, 200),
+        poll(53, 1000, 55, 800, 10_000, 43, 200),
+        poll(54, 1001, 56, 801, 10_000, 44, 201),
+    ];
+    let first = SensorSample {
+        gpu_temp_c: 70,
+        gpu_clock_mhz: 2200,
+        gpu_usage_percent: 80,
+        fan_speed: 1400,
+        ram_clock_mhz: 14_100,
+        ram_usage_percent: 34,
+        fps: 0,
+        tgp_watts: 500,
+    };
+    let second = SensorSample {
+        gpu_temp_c: 54,
+        gpu_clock_mhz: 1000,
+        gpu_usage_percent: 55,
+        fan_speed: 801,
+        ram_clock_mhz: 10_000,
+        ram_usage_percent: 44,
+        fps: 0,
+        tgp_watts: 201,
+    };
+    let rig = Rig::new();
+
+    run_on(&rig, adaptive(Some(12), FeedFrameLen::Full), &polls);
+
+    assert_eq!(rig.delivered(FEED), [4000, 5000, 10_000, 11_000]);
+    let expected = [first, first, second, second];
+    assert_eq!(rig.feed_frames(), frames_of(&expected, FeedFrameLen::Full));
+}
+
+#[test]
+fn falling_under_the_threshold_in_a_window_drops_it_and_sends_the_live_sample_at_once() {
+    let rig = Rig::new();
+    let mut polls = vec![at_usage(60), at_usage(70), at_usage(30)];
+    polls.extend([at_usage(80); 7]);
+
+    run_on(&rig, adaptive(Some(10), FeedFrameLen::Full), &polls);
+
+    // Nothing for the two polls dropped. The next window is five whole polls.
+    assert_eq!(rig.delivered(FEED), [2000, 7000, 8000]);
+    let expected = [at_usage(30), at_usage(80), at_usage(80)];
+    assert_eq!(rig.feed_frames(), frames_of(&expected, FeedFrameLen::Full));
+}
+
+#[test]
+fn falling_under_the_threshold_in_a_pair_replaces_the_second_frame_with_the_live_sample() {
+    let rig = Rig::new();
+    let polls = [[at_usage(80); 5].as_slice(), &[at_usage(30)]].concat();
+
+    run_on(&rig, adaptive(Some(8), FeedFrameLen::Full), &polls);
+
+    assert_eq!(
+        rig.delivered(FEED),
+        [4000, 5000, 6000, 7000],
+        "per-second frames resume at once"
+    );
+    let expected = [at_usage(80), at_usage(30), at_usage(30), at_usage(30)];
+    assert_eq!(rig.feed_frames(), frames_of(&expected, FeedFrameLen::Full));
+}
+
+#[test]
+fn rising_over_the_threshold_starts_a_whole_window() {
+    let rig = Rig::new();
+    let polls = [[at_usage(20); 3].as_slice(), &[at_usage(80)]].concat();
+
+    run_on(&rig, adaptive(Some(9), FeedFrameLen::Full), &polls);
+
+    assert_eq!(rig.delivered(FEED), [0, 1000, 2000, 7000, 8000]);
+}
+
+// A zero reads as a failure, and the feed must show one rather than a summary
+// of what came before.
+#[test]
+fn sensors_failing_under_load_show_zeros_at_once() {
+    let rig = Rig::new();
+    let opens = Cell::new(0);
+    let reads = Rc::new(Cell::new(0));
+    let open = |_: Option<u32>| {
+        opens.set(opens.get() + 1);
+        if opens.get() > 1 {
+            return Err(Error::Adapter("gone".into()));
+        }
+        let reads = reads.clone();
+        Ok(ScriptedSensors {
+            read: move || {
+                reads.set(reads.get() + 1);
+                if reads.get() < 3 {
+                    Ok(at_usage(90))
+                } else {
+                    broken_sensors().read()
+                }
+            },
+        })
+    };
+
+    rig.run_configured(adaptive(Some(4), FeedFrameLen::Full), open)
+        .unwrap();
+
+    assert_eq!(rig.delivered(FEED), [2000, 3000]);
+    let zeros = [SensorSample::default(); 2];
+    assert_eq!(rig.feed_frames(), frames_of(&zeros, FeedFrameLen::Full));
+}
+
+#[test]
+fn a_busy_lock_on_the_first_frame_of_a_pair_moves_nothing() {
+    let rig = Rig::new();
+    rig.upload(3500, 4500);
+
+    run_under_load(&rig, 12);
+
+    assert_eq!(rig.delivered(FEED), [5000, 10_000, 11_000]);
+    assert_eq!(rig.attempts(PROBE), [0], "skipping must not reconnect");
+    assert_only_allowed_frames(&rig.trace());
+}
+
+#[test]
+fn a_busy_lock_on_the_second_frame_of_a_pair_moves_nothing() {
+    let rig = Rig::new();
+    rig.upload(4500, 5500);
+
+    run_under_load(&rig, 12);
+
+    assert_eq!(rig.delivered(FEED), [4000, 10_000, 11_000]);
+    assert_eq!(rig.attempts(PROBE), [0], "skipping must not reconnect");
+}
+
+#[test]
+fn an_upload_across_whole_windows_ends_in_the_next_pair_and_not_a_burst() {
+    let rig = Rig::new();
+    rig.upload(500, 30_500);
+
+    run_under_load(&rig, 36);
+
+    assert_eq!(rig.delivered(FEED), [34_000, 35_000]);
+}
+
+#[test]
+fn a_failed_first_frame_of_a_pair_is_not_sent_again() {
+    let rig = Rig::new();
+    rig.fault(3500, 4500, Some(FEED), eio);
+
+    run_under_load(&rig, 12);
+
+    assert_eq!(rig.attempts(FEED), [4000, 5000, 10_000, 11_000]);
+    assert_eq!(rig.delivered(FEED), [5000, 10_000, 11_000]);
+    assert_eq!(rig.attempts(PROBE), [0]);
+    assert_only_allowed_frames(&rig.trace());
+}
+
+#[test]
+fn a_failed_second_frame_of_a_pair_is_not_sent_again() {
+    let rig = Rig::new();
+    rig.fault(4500, 5500, Some(FEED), eio);
+
+    run_under_load(&rig, 12);
+
+    assert_eq!(rig.attempts(FEED), [4000, 5000, 10_000, 11_000]);
+    assert_eq!(rig.delivered(FEED), [4000, 10_000, 11_000]);
+    assert_eq!(rig.attempts(PROBE), [0]);
+    assert_only_allowed_frames(&rig.trace());
+}
+
+#[test]
+fn failures_count_across_the_silent_ticks_and_a_new_session_starts_a_new_window() {
+    let rig = Rig::new();
+    rig.fault(3500, 10_500, Some(FEED), eio);
+    assert_eq!(WRITE_ATTEMPTS, 3);
+
+    run_under_load(&rig, 17);
+
+    assert_eq!(rig.attempts(FEED), [4000, 5000, 10_000, 16_000, 17_000]);
+    assert_eq!(rig.delivered(FEED), [16_000, 17_000]);
+    assert_eq!(rig.attempts(PROBE), [0, 12_000]);
+    assert_only_allowed_frames(&rig.trace());
+}
+
+#[test]
+fn a_good_write_clears_the_count_of_failures_in_a_pair() {
+    let rig = Rig::new();
+    rig.fault(3500, 4500, Some(FEED), eio);
+    rig.fault(9500, 10_500, Some(FEED), eio);
+    rig.fault(15_500, 16_500, Some(FEED), eio);
+
+    run_under_load(&rig, 18);
+
+    assert_eq!(rig.delivered(FEED), [5000, 11_000, 17_000]);
+    assert_eq!(rig.attempts(PROBE), [0]);
+}
+
+#[test]
+fn a_silent_tick_touches_no_lock_and_the_bus_stays_free_for_an_upload() {
+    let rig = Rig::new();
+    let path = rig.lock_path();
+    let lock_free = move || drop(BusLock::try_acquire(&path).unwrap());
+    *rig.clock.on_sleep.borrow_mut() = Some(Box::new(lock_free));
+
+    run_under_load(&rig, 12);
+
+    assert_eq!(rig.delivered(FEED), [4000, 5000, 10_000, 11_000]);
+    assert_only_allowed_frames(&rig.trace());
+}
+
+#[test]
+fn work_does_not_push_the_adaptive_cadence() {
+    let rig = Rig::new();
+    rig.device.write_cost.set(ms(20));
+    let clock = rig.clock.clone();
+    let slow_sensors = move |_: Option<u32>| {
+        let clock = clock.clone();
+        Ok(ScriptedSensors {
+            read: move || {
+                clock.advance(ms(30));
+                Ok(at_usage(90))
+            },
+        })
+    };
+    let config = adaptive(Some(600), FeedFrameLen::Full);
+
+    rig.run_configured(config, slow_sensors).unwrap();
+
+    let feed = rig.delivered(FEED);
+    let start = feed[0];
+    let cycle = (0..100).flat_map(|cycle| [cycle * 6000, cycle * 6000 + 1000]);
+    let expected: Vec<u64> = cycle.map(|at| start + at).collect();
+    assert_eq!(feed, expected);
+}
+
+#[test]
+fn a_jump_in_time_in_a_window_gives_no_catch_up() {
+    let rig = Rig::new();
+    let clock = rig.clock.clone();
+    rig.clock.at(2500, move || clock.advance(ms(60_000)));
+
+    run_under_load(&rig, 6);
+
+    assert_eq!(rig.delivered(FEED), [63_500, 64_500]);
+}
+
+#[test]
+fn shutdown_in_a_pair_is_prompt_and_sends_nothing() {
+    let rig = Rig::new();
+    rig.stop_at(4500);
+
+    run_on(&rig, adaptive(None, FeedFrameLen::Full), &[at_usage(90)]);
+
+    rig.assert_stopped_promptly(4500);
+    assert_eq!(rig.delivered(FEED), [4000]);
+}
+
+#[test]
+fn no_forbidden_frame_in_adaptive_under_load_at_either_length() {
+    for feed in BOTH_LENGTHS {
+        let rig = Rig::new();
+        rig.panel_has(0xFF, 4);
+
+        run_through_everything_at(&rig, adaptive(None, feed), at_usage(90), 2, 30);
+
+        assert_eq!(rig.attempts(DASHBOARD), []);
+    }
+}
+
+#[test]
+fn no_forbidden_frame_in_adaptive_under_the_threshold_at_either_length() {
+    for feed in BOTH_LENGTHS {
+        let rig = Rig::new();
+
+        run_through_everything_at(&rig, adaptive(None, feed), at_usage(20), 4, 100);
+
+        assert_eq!(rig.delivered(DASHBOARD).len(), 1);
+    }
+}
+
+// The load swings across the threshold every few polls, so that every state of
+// the schedule meets the outages.
+#[test]
+fn no_forbidden_frame_in_adaptive_with_a_swinging_load_and_e1_on_each_connection() {
+    let rig = Rig::new();
+    rig.device.forgets_e1.set(true);
+    rig.outage(3500, 9000);
+    rig.fault(20_500, 30_500, Some(FEED), eio);
+    rig.fault(45_500, 48_500, Some(FEED), short_read);
+    rig.upload(60_500, 66_500);
+    rig.stop_at(200_000);
+    let usages = [90, 90, 90, 20, 90, 90, 90, 90, 90, 90, 10, 90, 90];
+    let polls: Vec<SensorSample> = usages
+        .iter()
+        .cycle()
+        .take(200)
+        .copied()
+        .map(at_usage)
+        .collect();
+    let config = adaptive(None, FeedFrameLen::Truncated);
+
+    run_on(&rig, config, &polls);
+
+    assert_allowed_frames(&rig.trace(), config);
+    let answered = rig.delivered(READ_BACK).len();
+    assert_eq!(rig.attempts(DASHBOARD).len(), answered);
+    assert!(answered >= 2, "{:?}", rig.trace());
+    let feed = rig.delivered(FEED);
+    assert!(
+        feed.windows(2).all(|pair| pair[1] - pair[0] >= 1000),
+        "frames closer than a tick: {feed:?}"
+    );
+}
+
+thread_local! {
+    /// What the running test logged. Tests run on threads of their own, so
+    /// parallel tests do not see each other's lines.
+    static LOGGED: RefCell<Vec<(Level, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+struct Capture;
+
+impl Log for Capture {
+    fn enabled(&self, _: &Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &Record<'_>) {
+        let line = (record.level(), record.args().to_string());
+        LOGGED.with_borrow_mut(|lines| lines.push(line));
+    }
+
+    fn flush(&self) {}
+}
+
+/// Starts keeping the log lines of this thread.
+fn capture_log() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        log::set_logger(&Capture).unwrap();
+        log::set_max_level(log::LevelFilter::Debug);
+    });
+    LOGGED.with_borrow_mut(Vec::clear);
+}
+
+/// The lines logged at `level` that start with `prefix`.
+fn logged(level: Level, prefix: &str) -> Vec<String> {
+    LOGGED.with_borrow(|lines| {
+        let matching = lines
+            .iter()
+            .filter(|(at, line)| *at == level && line.starts_with(prefix));
+        matching.map(|(_, line)| line.clone()).collect()
+    })
+}
+
+fn write_cost_lines() -> Vec<String> {
+    logged(Level::Info, "E3 write cost")
+}
+
+fn write_lines() -> Vec<String> {
+    logged(Level::Debug, "E3 write of")
+}
+
+#[test]
+fn the_write_cost_is_the_write_alone_and_summarized_every_60_ticks() {
+    capture_log();
+    assert_eq!(WRITE_COST_REPORT_TICKS, 60);
+    let rig = Rig::new();
+    rig.device.write_cost.set(ms(25));
+    let clock = rig.clock.clone();
+    let slow_sensors = move |_: Option<u32>| {
+        let clock = clock.clone();
+        Ok(ScriptedSensors {
+            read: move || {
+                clock.advance(ms(30));
+                Ok(SAMPLE)
+            },
+        })
+    };
+
+    rig.run(Some(125), slow_sensors).unwrap();
+
+    let writes = write_lines();
+    assert_eq!(writes.len(), 125);
+    assert!(
+        writes
+            .iter()
+            .all(|line| line == "E3 write of 256 bytes took 25.0ms"),
+        "{writes:?}"
+    );
+    assert_eq!(
+        write_cost_lines(),
+        ["E3 write cost: count 60, mean 25.0ms, max 25.0ms"; 2]
+    );
+}
+
+#[test]
+fn the_write_cost_summary_gives_mean_and_max_of_its_own_period() {
+    capture_log();
+    let rig = Rig::new();
+    rig.device.write_cost.set(ms(10));
+    let device = rig.device.clone();
+    rig.clock.at(29_500, move || device.write_cost.set(ms(30)));
+    let device = rig.device.clone();
+    rig.clock.at(60_500, move || device.write_cost.set(ms(5)));
+
+    rig.ticks(120).unwrap();
+
+    assert_eq!(
+        write_cost_lines(),
+        [
+            "E3 write cost: count 60, mean 20.0ms, max 30.0ms",
+            "E3 write cost: count 60, mean 5.4ms, max 30.0ms",
+        ]
+    );
+}
+
+#[test]
+fn the_write_cost_of_an_adaptive_feed_names_the_length_and_counts_ticks_not_writes() {
+    capture_log();
+    let rig = Rig::new();
+    rig.device.write_cost.set(ms(12));
+
+    run_on(
+        &rig,
+        adaptive(Some(60), FeedFrameLen::Truncated),
+        &[at_usage(90)],
+    );
+
+    assert_eq!(write_lines(), ["E3 write of 128 bytes took 12.0ms"; 20]);
+    assert_eq!(
+        write_cost_lines(),
+        ["E3 write cost: count 20, mean 12.0ms, max 12.0ms"]
+    );
+}
+
+#[test]
+fn a_failed_write_is_logged_and_stays_out_of_the_summary() {
+    capture_log();
+    let rig = Rig::new();
+    rig.device.write_cost.set(ms(40));
+    rig.fault(2500, 3500, Some(FEED), eio);
+
+    rig.ticks(60).unwrap();
+
+    assert_eq!(
+        logged(Level::Debug, "E3 write of 256 bytes failed"),
+        ["E3 write of 256 bytes failed after 40.0ms"]
+    );
+    assert_eq!(
+        write_cost_lines(),
+        ["E3 write cost: count 59, mean 40.0ms, max 40.0ms"]
+    );
+}
+
+#[test]
+fn a_skipped_tick_costs_no_write_and_a_period_without_writes_reports_nothing() {
+    capture_log();
+    let rig = Rig::new();
+    rig.upload(500, 179_500);
+
+    rig.ticks(181).unwrap();
+
+    assert_eq!(rig.delivered(FEED), [0, 180_000]);
+    assert_eq!(write_lines().len(), 2);
+    assert_eq!(
+        write_cost_lines(),
+        ["E3 write cost: count 1, mean 0.0ns, max 0.0ns"]
+    );
+}
+
+#[test]
+fn a_dry_run_has_no_bus_to_measure() {
+    capture_log();
+    let rig = Rig::new();
+
+    dry_run(&rig, Some(60), Output::default()).unwrap();
+
+    assert_eq!(write_lines(), [""; 0]);
+    assert_eq!(write_cost_lines(), [""; 0]);
 }
 
 /// A [`Write`] that keeps what it gets, for checking after the run.
