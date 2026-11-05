@@ -18,8 +18,7 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 /// Connects and uploads `payload`, then with `persist` saves to NVRAM.
 ///
 /// Call this last: it starts with the probe, so everything that can be refused
-/// must have been refused by then. A real run pauses as the firmware needs and a
-/// dry run does not, and only a real run on a terminal shows progress.
+/// must have been refused by then.
 ///
 /// `AA` follows a successful upload only. It skips [`Retrying`], as the `save`
 /// command does: a repeat would be a second NVRAM write.
@@ -30,13 +29,7 @@ pub fn send(
     globals: &crate::Globals,
 ) -> Result<()> {
     let mut session = session::connect(&globals.options())?;
-    let dry_run = matches!(session, Session::DryRun(_));
-    let mut clock: Box<dyn Sleep> = if dry_run {
-        Box::new(NoSleep)
-    } else {
-        Box::new(ThreadSleep)
-    };
-    let mut meter = Meter::new(!dry_run && std::io::stderr().is_terminal());
+    let (mut clock, mut meter) = pacing(&session);
 
     let uploaded = Panel::new(Retrying::new(&mut session)).upload(
         payload,
@@ -55,8 +48,20 @@ pub fn send(
     Ok(())
 }
 
+/// The clock and progress line of a run. A real run pauses as the firmware needs
+/// and a dry run does not, and only a real run on a terminal shows progress.
+pub fn pacing<T, W>(session: &Session<T, W>) -> (Box<dyn Sleep>, Meter) {
+    match session {
+        Session::Live(_) => (
+            Box::new(ThreadSleep),
+            Meter::new(std::io::stderr().is_terminal()),
+        ),
+        Session::DryRun(_) => (Box::new(NoSleep), Meter::new(false)),
+    }
+}
+
 /// A progress line on stderr, away from the dump and any piped output.
-struct Meter {
+pub struct Meter {
     enabled: bool,
     last_drawn: Option<Instant>,
 }
@@ -69,7 +74,8 @@ impl Meter {
         }
     }
 
-    fn update(&mut self, progress: UploadProgress) {
+    /// Draws the line, if it is time to.
+    pub fn update(&mut self, progress: UploadProgress) {
         let now = Instant::now();
         if self.enabled && is_due(self.last_drawn, now, progress) {
             let mut stderr = std::io::stderr();
@@ -80,9 +86,10 @@ impl Meter {
         }
     }
 
-    /// Ends the line, so that an error starts on its own.
-    fn finish(&self) {
-        if self.last_drawn.is_some() {
+    /// Ends the line, so that what comes next starts on its own. Calling this
+    /// again does nothing.
+    pub fn finish(&mut self) {
+        if self.last_drawn.take().is_some() {
             eprintln!();
         }
     }

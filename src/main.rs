@@ -74,6 +74,11 @@ enum Command {
     On(commands::on::Args),
     /// Check that the panel controller answers, and show its status
     Probe(commands::probe::Args),
+    /// Repair a frozen or dark panel
+    ///
+    /// By default this sends no overlay and does not touch NVRAM, which is the
+    /// combination that has actually lit a dark panel.
+    Recover(commands::recover::Args),
     /// Save the panel configuration: this writes to the panel's NVRAM
     ///
     /// In text mode the same frame also starts the text rainbow effect.
@@ -100,6 +105,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Off(args) => commands::off::run(args, &cli.globals),
         Command::On(args) => commands::on::run(args, &cli.globals),
         Command::Probe(args) => commands::probe::run(args, &cli.globals),
+        Command::Recover(args) => commands::recover::run(args, &cli.globals),
         Command::Save(args) => commands::save::run(args, &cli.globals),
         Command::Status(args) => commands::status::run(args, &cli.globals),
         Command::Text(args) => commands::text::run(args, &cli.globals),

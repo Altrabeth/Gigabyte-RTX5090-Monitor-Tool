@@ -86,14 +86,16 @@
 
 use std::time::Duration;
 
-use crate::bus::transport::Transport;
+use crate::bus::transport::{Retrying, Transport};
 use crate::error::{Error, Result};
+use crate::image::solid_frame;
 use crate::protocol::{
     build_upload, carousel_frame, display_frame, display_query_frame, firmware_query_frame,
     loop_query_frame, mode_frame, mode_query_frame, parse_display, parse_firmware, parse_loop_bank,
-    parse_mode, power_frame, save_frame, sensor_frame, DisplayStatus, Elements, FeedFrameLen,
-    FirmwareVersion, Frame, Framebuffer, LoopBank, Mode, ModeStatus, SensorSample, UploadFrame,
-    UploadFrameKind, UploadParams, LOOP_BANK_FIRST, LOOP_BANK_LAST, LOOP_READ_LEN, STATUS_READ_LEN,
+    parse_mode, power_frame, save_frame, sensor_frame, DisplayStatus, Element, Elements,
+    FeedFrameLen, FirmwareVersion, Frame, Framebuffer, LoopBank, Mode, ModeStatus, SensorSample,
+    UploadFrame, UploadFrameKind, UploadParams, DESCRIPTOR, LOOP_BANK_FIRST, LOOP_BANK_LAST,
+    LOOP_READ_LEN, STATUS_READ_LEN,
 };
 
 /// Pause after the `F2` BEGIN marker. `PACE_BEGIN` in `aorus_lcd.py`.
@@ -109,6 +111,27 @@ pub const DEFAULT_CHUNK_DELAY: Duration = Duration::from_millis(10);
 /// Pause between `SetMode` and the first frame of a GIF. `upload_content` in
 /// `aorus_lcd.py`, `GifModeSettleMs` in `PanelController.cs`.
 const GIF_MODE_SETTLE: Duration = Duration::from_millis(200);
+
+/// Pause after each `E7` of a recovery. `PowerCycleSettleMs` in `PanelRecovery.cs`.
+const RECOVERY_POWER_SETTLE: Duration = Duration::from_millis(1000);
+
+/// Pause after a recovery's upload. `UploadSettleMs` in `PanelRecovery.cs`.
+const RECOVERY_UPLOAD_SETTLE: Duration = Duration::from_millis(500);
+
+/// Pause after each `SetMode` of a recovery. `ModeSettleMs` in `PanelRecovery.cs`.
+const RECOVERY_MODE_SETTLE: Duration = Duration::from_millis(300);
+
+/// The mode a recovery passes through on its way to [`Mode::Image`]. `ChibTime`
+/// in `PanelRecovery.cs`.
+const RECOVERY_NUDGE_MODE: Mode = Mode::ChibiClock;
+
+/// The widgets of [`RecoveryOverlay::Enable`]. `DashboardWidgets` in
+/// `PanelRecovery.cs`.
+const RECOVERY_OVERLAY_WIDGETS: Elements = Elements::NONE.with(Element::GpuTemp).with(Element::Tgp);
+
+/// The rotation interval of [`RecoveryOverlay::Enable`], in seconds.
+/// `OverlayIntervalSeconds` in `PanelRecovery.cs`.
+const RECOVERY_OVERLAY_INTERVAL_S: u8 = 3;
 
 /// Waits for a while. All delays in this crate go through this trait, because
 /// the firmware's pacing has to be asserted in tests without real waiting.
@@ -208,6 +231,75 @@ pub struct UploadProgress {
     pub sent: usize,
     /// Frames in the whole upload.
     pub total: usize,
+}
+
+/// What a recovery does about the sensor overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RecoveryOverlay {
+    /// Sends no `E1`, so any overlay stays exactly as it is.
+    #[default]
+    Keep,
+    /// Sends `E1` with no widgets and interval 0, which removes the overlay.
+    Clear,
+    /// Sends `E1` with GPU temperature and TGP, interval 3.
+    Enable,
+}
+
+/// What [`Panel::recover`] does.
+///
+/// The default sends neither `E1` nor `AA`, unlike the defaults of the C# tool's
+/// CLI. It matches the C# Recover button, and it is what actually lit a dark
+/// panel: `RECOVERY.md` section 4 suspects `E1` in every attempt that stayed dark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryOptions {
+    /// Whether to start with an `E7` off and on.
+    pub power_cycle: bool,
+    /// The colour of the frame to upload as `[r, g, b]`, `None` for no upload.
+    pub fill: Option<[u8; 3]>,
+    /// The mode to end up in.
+    pub target: Mode,
+    /// What to do about the overlay.
+    pub overlay: RecoveryOverlay,
+    /// Whether to finish with `AA`, which writes NVRAM.
+    pub save: bool,
+}
+
+impl Default for RecoveryOptions {
+    fn default() -> Self {
+        Self {
+            power_cycle: true,
+            fill: Some([0, 0, 0]),
+            target: Mode::Faith1,
+            overlay: RecoveryOverlay::Keep,
+            save: false,
+        }
+    }
+}
+
+/// A step of a recovery, reported as it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryStep {
+    /// `E7` off and on.
+    PowerCycle,
+    /// A solid frame of this colour.
+    Upload([u8; 3]),
+    /// Switching to this mode, through the nudge if it needs one.
+    SetMode(Mode),
+    /// `E1` without widgets.
+    ClearOverlay,
+    /// `E1` with widgets.
+    EnableOverlay,
+    /// `AA`.
+    Save,
+}
+
+/// What [`Panel::recover`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryEvent {
+    /// A step is starting.
+    Step(RecoveryStep),
+    /// A frame of the upload went out.
+    Upload(UploadProgress),
 }
 
 /// The panel's operations over a link. See the [module docs](self).
@@ -406,6 +498,86 @@ impl<T: Transport> Panel<T> {
     }
 }
 
+impl<T: Transport, S: Sleep> Panel<Retrying<T, S>> {
+    /// Repairs a frozen or dark panel: power-cycles it, uploads a solid frame,
+    /// because the wedged content lives in the framebuffer and `SetMode` alone
+    /// does not repaint, and selects the target. `RunAsync` in `PanelRecovery.cs`.
+    ///
+    /// This takes a [`Retrying`] link because one rejected transfer must not
+    /// leave a panel switched off. `AA` is the exception and goes to the link
+    /// underneath, as for the `save` command, since a repeat would be a second
+    /// NVRAM write.
+    ///
+    /// Run it on a [`Verified`](crate::session::Verified), which holds the bus
+    /// lock throughout. Released between steps, the lock would let the daemon's
+    /// `E3` frames in during the settling pauses.
+    ///
+    /// `sleep` paces the steps and the upload. Retries wait on the clock inside
+    /// `Retrying`, so `sleep` sees exactly the sequence's own delays.
+    ///
+    /// # Errors
+    ///
+    /// The first failure ends the recovery, with nothing further written, so a
+    /// failed `E7` on leaves the panel off. See [`Panel::upload`] for the errors
+    /// of the upload.
+    pub fn recover(
+        mut self,
+        options: &RecoveryOptions,
+        sleep: &mut dyn Sleep,
+        mut report: impl FnMut(RecoveryEvent),
+    ) -> Result<()> {
+        if options.power_cycle {
+            report(RecoveryEvent::Step(RecoveryStep::PowerCycle));
+            self.off()?;
+            sleep.sleep(RECOVERY_POWER_SETTLE);
+            self.on()?;
+            sleep.sleep(RECOVERY_POWER_SETTLE);
+        }
+
+        if let Some(colour) = options.fill {
+            report(RecoveryEvent::Step(RecoveryStep::Upload(colour)));
+            self.upload(
+                &[&DESCRIPTOR[..], &solid_frame(colour)].concat(),
+                &UploadParams::still(Framebuffer::Static),
+                UploadOptions::default(),
+                sleep,
+                |progress| report(RecoveryEvent::Upload(progress)),
+            )?;
+            sleep.sleep(RECOVERY_UPLOAD_SETTLE);
+        }
+
+        report(RecoveryEvent::Step(RecoveryStep::SetMode(options.target)));
+        if options.target == Mode::Image {
+            // The upload left the panel in image mode, and without a genuine
+            // change `SetMode` does not re-render. As in `PanelRecovery.cs`, this
+            // also runs without an upload, when the mode is simply unknown.
+            self.set_mode(RECOVERY_NUDGE_MODE)?;
+            sleep.sleep(RECOVERY_MODE_SETTLE);
+        }
+        self.set_mode(options.target)?;
+        sleep.sleep(RECOVERY_MODE_SETTLE);
+
+        match options.overlay {
+            RecoveryOverlay::Keep => {}
+            RecoveryOverlay::Clear => {
+                report(RecoveryEvent::Step(RecoveryStep::ClearOverlay));
+                self.set_dashboard(Elements::NONE, 0)?;
+            }
+            RecoveryOverlay::Enable => {
+                report(RecoveryEvent::Step(RecoveryStep::EnableOverlay));
+                self.set_dashboard(RECOVERY_OVERLAY_WIDGETS, RECOVERY_OVERLAY_INTERVAL_S)?;
+            }
+        }
+
+        if options.save {
+            report(RecoveryEvent::Step(RecoveryStep::Save));
+            let (link, _) = self.transport.into_parts();
+            Panel::new(link).save()?;
+        }
+        Ok(())
+    }
+}
+
 /// The total of the pauses [`Panel::upload`] will make, the firmware's pacing and
 /// nothing else, so a real upload takes longer by its time on the bus.
 ///
@@ -456,10 +628,9 @@ mod tests {
 
     use super::*;
     use crate::bus::transport::testing::{i2c_error, Mock};
-    use crate::bus::transport::Retrying;
     use crate::protocol::{
-        marker_frame, Element, LoopEntry, Marker, DESCRIPTOR, FRAME_BYTES, FRAME_LEN,
-        OP_SENSOR_FEED, OP_SET_MODE, OP_UPLOAD_HEADER,
+        marker_frame, LoopEntry, Marker, FRAME_BYTES, FRAME_LEN, OP_SENSOR_FEED, OP_SET_MODE,
+        OP_UPLOAD_HEADER,
     };
 
     const BANKS: std::ops::RangeInclusive<u8> = LOOP_BANK_FIRST..=LOOP_BANK_LAST;
