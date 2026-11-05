@@ -2,18 +2,18 @@
 //! Command logic lives in [`commands`], and below that in the library.
 
 mod commands;
+mod logging;
 
 use std::error::Error as _;
 use std::process::ExitCode;
 
+use aorus_lcd::session::Options;
 use aorus_lcd::Result;
 use clap::{Args, Parser, Subcommand};
 
 /// Drive the LCD side panel of a Gigabyte AORUS RTX 5090 Master.
 #[derive(Debug, Parser)]
 #[command(name = "aorus-lcd", version)]
-// The first subcommand reads these fields; remove the allow then.
-#[allow(dead_code)]
 struct Cli {
     #[command(flatten)]
     globals: Globals,
@@ -24,7 +24,6 @@ struct Cli {
 
 /// Options shared by every subcommand.
 #[derive(Debug, Args)]
-#[allow(dead_code)]
 pub struct Globals {
     /// Use I2C bus N instead of autodetecting; it must still be an NVIDIA adapter
     #[arg(long, value_name = "N", global = true)]
@@ -39,23 +38,40 @@ pub struct Globals {
     pub verbose: u8,
 }
 
+impl Globals {
+    /// The connection these options ask for. Options that only some commands
+    /// have, such as `--wait`, are left at their defaults.
+    pub fn options(&self) -> Options {
+        Options {
+            bus: self.bus,
+            dry_run: self.dry_run,
+            verbose: self.verbose > 0,
+            ..Options::default()
+        }
+    }
+}
+
 /// The subcommands. To add one, follow [`commands`], then add a variant such as
 /// `Probe(commands::probe::Args)` here and its arm in [`run`]. Keep both lists
 /// alphabetical, so that parallel branches touch different lines.
 #[derive(Debug, Subcommand)]
-enum Command {}
+enum Command {
+    /// Check that the panel controller answers, and show its status
+    Probe(commands::probe::Args),
+}
 
 /// Runs the chosen subcommand. An arm looks like
 /// `Command::Probe(args) => commands::probe::run(args, &cli.globals),`.
 fn run(cli: Cli) -> Result<()> {
-    match cli.command {}
+    match cli.command {
+        Command::Probe(args) => commands::probe::run(args, &cli.globals),
+    }
 }
 
-// `Command` has no variants yet, so `Cli` cannot be constructed. The first
-// subcommand removes this allow.
-#[allow(unreachable_code)]
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    logging::init(cli.globals.verbose);
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             report(&error);
@@ -98,5 +114,27 @@ mod tests {
     #[test]
     fn a_subcommand_is_required() {
         assert!(Cli::try_parse_from(["aorus-lcd", "--dry-run"]).is_err());
+    }
+
+    #[test]
+    fn global_options_become_session_options() {
+        let cli = Cli::try_parse_from(["aorus-lcd", "probe", "--bus", "3", "--dry-run", "-v"]);
+
+        assert_eq!(
+            cli.unwrap().globals.options(),
+            Options {
+                bus: Some(3),
+                dry_run: true,
+                verbose: true,
+                ..Options::default()
+            }
+        );
+    }
+
+    #[test]
+    fn nothing_is_a_dry_run_unless_asked() {
+        let cli = Cli::try_parse_from(["aorus-lcd", "probe"]).unwrap();
+
+        assert_eq!(cli.globals.options(), Options::default());
     }
 }

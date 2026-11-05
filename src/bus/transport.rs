@@ -54,6 +54,16 @@ impl<T: Transport + ?Sized> Transport for Box<T> {
     }
 }
 
+impl<T: Transport + ?Sized> Transport for &mut T {
+    fn write(&mut self, frame: &[u8]) -> Result<()> {
+        (**self).write(frame)
+    }
+
+    fn read(&mut self, buf: &mut [u8]) -> Result<()> {
+        (**self).read(buf)
+    }
+}
+
 /// The panel controller's 7-bit address, in the unshifted form `i2c-dev`
 /// expects (NVAPI wants it shifted left by one, `i2c-dev` does not). This is
 /// the only address in the crate: the RGB controller shares the bus, and a
@@ -175,9 +185,10 @@ pub struct LinuxI2c {
 
 impl LinuxI2c {
     /// Opens `/dev/i2c-{bus}`. No traffic happens here, but an open handle can
-    /// reach real hardware, so this belongs behind adapter discovery, the bus
-    /// lock and the probe.
-    pub fn open(bus: u32) -> Result<Self> {
+    /// reach real hardware, so this is not public: the write gate in
+    /// [`session`](crate::session) is its only caller, behind adapter discovery
+    /// and the bus lock, and hands the result out only after the probe.
+    pub(crate) fn open(bus: u32) -> Result<Self> {
         let path = device_path(bus);
         let file = File::options()
             .read(true)
@@ -245,8 +256,28 @@ fn errno_hint(source: &std::io::Error) -> Option<&'static str> {
     match Errno::from_io_error(source)? {
         Errno::NOENT => Some("no such device, is the i2c-dev kernel module loaded?"),
         Errno::ACCESS => Some("permission denied, is this user in the i2c group?"),
-        Errno::IO | Errno::NXIO | Errno::REMOTEIO => Some("no answer from the panel controller"),
+        errno if means_no_answer(errno) => Some("no answer from the panel controller"),
         _ => None,
+    }
+}
+
+/// Errnos of a transfer that reached the bus and got nothing back, going by the
+/// kernel's `i2c/fault-codes`.
+fn means_no_answer(errno: Errno) -> bool {
+    matches!(
+        errno,
+        Errno::IO | Errno::NXIO | Errno::REMOTEIO | Errno::TIMEDOUT
+    )
+}
+
+/// Whether a failed transfer means the controller did not answer, which may
+/// pass while it starts up, unlike a refusal. A short read counts: it is never
+/// presence, but it is not a refusal either.
+pub(crate) fn is_no_answer(error: &Error) -> bool {
+    match error {
+        Error::ShortRead { .. } => true,
+        Error::I2c { source, .. } => Errno::from_io_error(source).is_some_and(means_no_answer),
+        _ => false,
     }
 }
 
@@ -320,7 +351,8 @@ fn hex_dump(out: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn hex_row(bytes: &[u8]) -> String {
+/// Formats bytes as `EB 03 00`, the way the dry-run dump shows them.
+pub fn hex_row(bytes: &[u8]) -> String {
     let hex: Vec<String> = bytes.iter().map(|byte| format!("{byte:02X}")).collect();
     hex.join(" ")
 }
@@ -624,6 +656,7 @@ mod tests {
             (Errno::IO, "no answer"),
             (Errno::NXIO, "no answer"),
             (Errno::REMOTEIO, "no answer"),
+            (Errno::TIMEDOUT, "no answer"),
         ];
 
         for (errno, hint) in cases {
@@ -644,6 +677,22 @@ mod tests {
         let error = device_error("opening /dev/i2c-7".into(), Errno::BUSY.into());
 
         assert_eq!(error.to_string(), "opening /dev/i2c-7");
+    }
+
+    #[test]
+    fn only_a_silent_controller_counts_as_no_answer() {
+        for errno in [Errno::IO, Errno::NXIO, Errno::REMOTEIO, Errno::TIMEDOUT] {
+            assert!(is_no_answer(&device_error("reading".into(), errno.into())));
+        }
+        for errno in [Errno::ACCESS, Errno::NOENT, Errno::BUSY] {
+            assert!(!is_no_answer(&device_error("reading".into(), errno.into())));
+        }
+        assert!(is_no_answer(&Error::ShortRead {
+            expected: 8,
+            actual: 3
+        }));
+        assert!(!is_no_answer(&Error::ReadbackUnavailable));
+        assert!(!is_no_answer(&Error::Adapter("refused".into())));
     }
 
     #[test]

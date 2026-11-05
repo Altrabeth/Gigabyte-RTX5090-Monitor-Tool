@@ -15,5 +15,6 @@ pub mod panel;
 pub mod protocol;
 pub mod rle;
 pub mod sensors;
+pub mod session;
 
 pub use error::{Error, Result};
