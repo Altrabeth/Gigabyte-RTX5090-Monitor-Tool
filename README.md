@@ -117,6 +117,10 @@ rotation of the built-in screens plus stored user content. `F3` carousels accept
 - GIF payload: `u16 LE frame count`, then per frame a 10-byte entry
   (`u32 LE` **inclusive** end offset `2 + 10*N + sum(sizes) - 1`, `u16 width`, `u16 height`,
   `u16 format` where `3` = RLE), then the concatenated RLE frames.
+- The panel skips the first frame of a GIF: seen on firmware 1.3 of the RTX 5090 Master, by
+  position and regardless of content. `aorus-lcd gif` therefore sends the first frame twice,
+  so the frame count it sends is one more than the GIF has, and a GIF can have at most 255
+  frames. This is a workaround for observed behaviour, not documented protocol.
 - RLE tokens: 2-byte LE head, bit 15 = run flag, low 15 bits = pixel count.
   Run (only for 3+ identical pixels): head + one pixel. Literal: head + that many pixels.
   Encoding works in windows of at most `0x7FFF` pixels. A window with no repeat, or with
