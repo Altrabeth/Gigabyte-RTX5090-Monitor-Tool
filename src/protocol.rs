@@ -332,8 +332,8 @@ pub fn mode_frame(mode: Mode) -> Frame {
 /// Builds `E1`: one flag byte per element, then the rotation interval in
 /// seconds. `docs/PROTOCOL.md` section 3.
 ///
-/// Send it once on (re)connect and never periodically: it is the prime suspect
-/// in dark-panel incidents (`RECOVERY.md`).
+/// Send it at most once on (re)connect, only if `DF` shows a need, and never
+/// periodically: it is the prime suspect in dark-panel incidents (`RECOVERY.md`).
 pub fn display_frame(elements: Elements, interval_s: u8) -> Frame {
     let mut tail = [0; 9];
     for (flag, element) in tail.iter_mut().zip(Element::ALL) {

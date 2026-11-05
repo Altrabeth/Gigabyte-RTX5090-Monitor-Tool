@@ -86,7 +86,7 @@ DDC ports falsely ACK it). The controller can need up to a minute after boot to 
 |---|---|---|
 | `E7` | OpenLcd | panel on / off |
 | `E5` | SetMode | display mode (see below) |
-| `E1` | SetDisplay | dashboard overlay: sensor-element bitmask + rotation interval. Send once on (re)connect, never periodically; it is the prime suspect in dark-panel incidents (see `RECOVERY.md`). |
+| `E1` | SetDisplay | dashboard overlay: sensor-element bitmask + rotation interval. Send at most once on (re)connect, only if `DF` shows the panel needs it, never periodically; it is the prime suspect in dark-panel incidents (see `RECOVERY.md`). |
 | `E3` | Sensor feed | live GPU values, must be pushed about once per second |
 | `EA` / `EB 03` | Set / Get image template | `EB 03` doubles as presence probe |
 | `F3` | SetLoop | carousel |

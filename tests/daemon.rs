@@ -21,8 +21,9 @@ use aorus_lcd::daemon::{
 };
 use aorus_lcd::panel::Sleep;
 use aorus_lcd::protocol::{
-    display_frame, probe_frame, sensor_frame, FeedFrameLen, SensorSample, OP_GET_IMAGE_TPL,
-    OP_SAVE, OP_SENSOR_FEED, OP_SET_DISPLAY, PROBE_READ_LEN,
+    display_frame, display_query_frame, probe_frame, sensor_frame, DisplayStatus, Elements,
+    FeedFrameLen, SensorSample, OP_GET_DISPLAY, OP_GET_IMAGE_TPL, OP_SAVE, OP_SENSOR_FEED,
+    OP_SET_DISPLAY, PROBE_READ_LEN,
 };
 use aorus_lcd::sensors::{FakeSensors, SensorSource};
 use aorus_lcd::session::{self, connect_with, Options, Session};
@@ -33,6 +34,7 @@ use tempfile::TempDir;
 const PANEL: &str = "NVIDIA i2c adapter 1 at 1:00.0";
 const SMBUS: &str = "SMBus I801 adapter at 0000:00:1f.4";
 const PROBE: u8 = OP_GET_IMAGE_TPL;
+const READ_BACK: u8 = OP_GET_DISPLAY;
 const DASHBOARD: u8 = OP_SET_DISPLAY;
 const FEED: u8 = OP_SENSOR_FEED;
 const SAVE: u8 = OP_SAVE;
@@ -124,13 +126,17 @@ impl Clock for FakeClock {
     }
 }
 
-/// One attempted write, as the device saw it.
+/// One attempted write, as the device saw it, with the read that followed it.
 #[derive(Debug, Clone)]
 struct Sent {
     at: u64,
     frame: Vec<u8>,
+    /// Neither the write nor the read after it failed.
     ok: bool,
+    /// The lock was held for the write and the read after it.
     locked: bool,
+    /// What `DF` reported at the time of the write.
+    panel: DisplayStatus,
 }
 
 impl Sent {
@@ -176,6 +182,11 @@ fn errno_error(errno: Errno) -> Error {
 struct DeviceState {
     trace: RefCell<Vec<Sent>>,
     faults: RefCell<Vec<Fault>>,
+    read_faults: RefCell<Vec<Fault>>,
+    /// The widget mask and interval. A panel with no widgets unless set.
+    panel: Cell<(u8, u8)>,
+    /// `E1` goes unnoticed, as if the controller had lost it right away.
+    forgets_e1: Cell<bool>,
     no_answer_until: Cell<u64>,
     missing_until: Cell<u64>,
     refuse_open_from: Cell<Option<u64>>,
@@ -188,13 +199,35 @@ struct Device {
     lock_path: PathBuf,
 }
 
+impl Device {
+    fn locked(&self) -> bool {
+        matches!(
+            BusLock::try_acquire(&self.lock_path),
+            Err(Error::LockBusy { .. })
+        )
+    }
+
+    fn read_error(&self, opcode: u8, at: u64) -> Option<Error> {
+        if at < self.state.no_answer_until.get() {
+            return Some(errno_error(Errno::NXIO));
+        }
+        let faults = self.state.read_faults.borrow();
+        let fault = faults.iter().find(|fault| fault.hits(opcode, at));
+        fault.map(|fault| (fault.error)())
+    }
+
+    /// `E1` carries one flag byte per widget, then the interval.
+    fn store_dashboard(&self, frame: &[u8]) {
+        let flags = frame[5..13].iter().enumerate();
+        let mask = flags.fold(0, |mask, (bit, flag)| mask | (flag & 1) << bit);
+        self.state.panel.set((mask, frame[13]));
+    }
+}
+
 impl Transport for Device {
     fn write(&mut self, frame: &[u8]) -> Result<()> {
         let at = self.clock.elapsed_ms();
-        let locked = matches!(
-            BusLock::try_acquire(&self.lock_path),
-            Err(Error::LockBusy { .. })
-        );
+        let locked = self.locked();
         let faults = self.state.faults.borrow();
         let fault = faults.iter().find(|fault| fault.hits(frame[0], at));
         self.state.trace.borrow_mut().push(Sent {
@@ -202,7 +235,11 @@ impl Transport for Device {
             frame: frame.to_vec(),
             ok: fault.is_none(),
             locked,
+            panel: panel_status(self.state.panel.get()),
         });
+        if fault.is_none() && frame[0] == DASHBOARD && !self.state.forgets_e1.get() {
+            self.store_dashboard(frame);
+        }
         let outcome = fault.map_or(Ok(()), |fault| Err((fault.error)()));
         drop(faults);
         self.clock.advance(self.state.write_cost.get());
@@ -211,11 +248,27 @@ impl Transport for Device {
 
     fn read(&mut self, buf: &mut [u8]) -> Result<()> {
         let at = self.clock.elapsed_ms();
-        if at < self.state.no_answer_until.get() {
-            return Err(errno_error(Errno::NXIO));
+        let locked = self.locked();
+        let mut trace = self.state.trace.borrow_mut();
+        let query = trace.last_mut().expect("a read follows a query");
+        query.locked &= locked;
+        if let Some(error) = self.read_error(query.opcode(), at) {
+            query.ok = false;
+            return Err(error);
         }
         buf.fill(0x5A);
+        if query.opcode() == READ_BACK {
+            let (mask, interval) = self.state.panel.get();
+            buf.copy_from_slice(&[READ_BACK, mask, interval, 0]);
+        }
         Ok(())
+    }
+}
+
+fn panel_status((mask, interval_s): (u8, u8)) -> DisplayStatus {
+    DisplayStatus {
+        elements: Elements::from_bits(mask),
+        interval_s,
     }
 }
 
@@ -275,6 +328,21 @@ impl Rig {
         });
     }
 
+    /// The read after a frame of `opcode` fails between these times.
+    fn read_fault(&self, from: u64, to: u64, opcode: u8, error: fn() -> Error) {
+        self.device.read_faults.borrow_mut().push(Fault {
+            from,
+            to,
+            opcode: Some(opcode),
+            error,
+        });
+    }
+
+    /// What `DF` reports from now on.
+    fn panel_has(&self, mask: u8, interval: u8) {
+        self.device.panel.set((mask, interval));
+    }
+
     /// Every write fails between these times.
     fn outage(&self, from: u64, to: u64) {
         self.fault(from, to, None, eio);
@@ -323,6 +391,14 @@ impl Rig {
             max_ticks,
             ..DaemonConfig::default()
         };
+        self.run_configured(config, open_sensors)
+    }
+
+    fn run_configured<S: SensorSource>(
+        &self,
+        config: DaemonConfig,
+        open_sensors: impl FnMut(Option<u32>) -> Result<S>,
+    ) -> Result<()> {
         run_with(
             config,
             Environment {
@@ -376,6 +452,10 @@ impl Rig {
 
     fn trace(&self) -> Vec<Sent> {
         self.device.trace.borrow().clone()
+    }
+
+    fn opcodes(&self) -> Vec<u8> {
+        self.trace().iter().map(Sent::opcode).collect()
     }
 
     /// When frames of `opcode` were attempted, failed ones included.
@@ -433,32 +513,53 @@ fn no_sensors(_: Option<u32>) -> Result<FakeSensors> {
     Err(Error::Adapter("no sensors in this test".into()))
 }
 
+fn assert_only_allowed_frames(trace: &[Sent]) {
+    assert_allowed_frames(trace, DaemonConfig::default());
+}
+
 /// The rules of the wire, over a whole trace. Failed attempts count: a frame that
 /// reached the controller partly is still a frame sent.
 ///
-/// Every frame is `EB 03`, the configured `E1`, or `E3`, and each `E1` directly
-/// follows a probe that went out, once per connection, with `E3` only after it.
-fn assert_only_allowed_frames(trace: &[Sent]) {
-    let config = DaemonConfig::default();
-    let dashboard = display_frame(config.elements, config.interval_s);
+/// Every frame is `EB 03`, `DF`, the configured `E1`, or `E3`, all under the
+/// lock. Each `DF` directly follows a probe that went out. An `E1` directly
+/// follows a `DF` that got an answer, so there is at most one per connection, and
+/// only if that answer calls for it. `E3` needs that answer and any such `E1`.
+fn assert_allowed_frames(trace: &[Sent], config: DaemonConfig) {
+    let wanted = config.dashboard();
+    let dashboard = display_frame(wanted.elements, wanted.interval_s);
+    let needs_e1 = |panel: DisplayStatus| match config.elements {
+        Some(_) => panel != wanted,
+        None => panel.elements == Elements::NONE,
+    };
     let mut probed = false;
+    let mut read_back = None;
     let mut configured = false;
     for sent in trace {
         match sent.opcode() {
             PROBE => {
                 assert_eq!(sent.frame[..], probe_frame()[..], "not EB 03");
                 probed = sent.ok;
+                read_back = None;
                 configured = false;
+            }
+            READ_BACK => {
+                assert_eq!(sent.frame[..], display_query_frame()[..], "not DF");
+                assert!(probed, "DF without a probe just before it: {sent:?}");
+                probed = false;
+                read_back = sent.ok.then_some(sent.panel);
+                configured = sent.ok && !needs_e1(sent.panel);
             }
             DASHBOARD => {
                 assert_eq!(sent.frame[..], dashboard[..], "an unexpected E1");
-                assert!(probed, "E1 without a probe just before it: {sent:?}");
-                probed = false;
+                let panel = read_back.take();
+                let panel = panel.expect("E1 without an answered DF just before it");
+                assert!(needs_e1(panel), "E1 for a panel that needs none: {sent:?}");
                 configured = sent.ok;
             }
             FEED => {
                 assert_eq!(sent.frame.len(), FeedFrameLen::Full.bytes());
-                assert!(configured, "E3 before the connection's E1: {sent:?}");
+                assert!(configured, "E3 before the panel was ready: {sent:?}");
+                read_back = None;
             }
             SAVE => panic!("AA must never be sent: {sent:?}"),
             other => panic!("the daemon must not send {other:02X}: {sent:?}"),
@@ -479,24 +580,185 @@ impl<G: FnMut() -> Result<SensorSample>> SensorSource for ScriptedSensors<G> {
 }
 
 #[test]
-fn the_panel_gets_probe_then_dashboard_then_feed() {
+fn a_panel_with_no_widgets_gets_probe_then_read_back_then_dashboard_then_feed() {
     let rig = Rig::new();
 
     rig.ticks(3).unwrap();
 
     let trace = rig.trace();
-    let opcodes: Vec<u8> = trace.iter().map(Sent::opcode).collect();
-    assert_eq!(opcodes, [PROBE, DASHBOARD, FEED, FEED, FEED]);
+    assert_eq!(
+        rig.opcodes(),
+        [PROBE, READ_BACK, DASHBOARD, FEED, FEED, FEED]
+    );
     assert_eq!(rig.delivered(FEED), [0, 1000, 2000]);
     assert_eq!(
-        trace[1].frame[..],
-        display_frame(DaemonConfig::default().elements, 3)[..]
-    );
-    assert_eq!(
         trace[2].frame[..],
+        display_frame(Elements::from_bits(0xAF), 3)[..]
+    );
+    assert_eq!(rig.device.panel.get(), (0xAF, 3));
+    assert_eq!(
+        trace[3].frame[..],
         sensor_frame(&SAMPLE, FeedFrameLen::Full)[..]
     );
     assert_only_allowed_frames(&trace);
+}
+
+fn naming(mask: u8, interval_s: u8, ticks: u64) -> DaemonConfig {
+    DaemonConfig {
+        elements: Some(Elements::from_bits(mask)),
+        interval_s,
+        max_ticks: Some(ticks),
+        ..DaemonConfig::default()
+    }
+}
+
+fn healthy(_: Option<u32>) -> Result<FakeSensors> {
+    Ok(healthy_sensors())
+}
+
+#[test]
+fn a_panel_that_matches_the_named_widgets_gets_no_e1() {
+    let rig = Rig::new();
+    rig.panel_has(0x05, 7);
+    let config = naming(0x05, 7, 2);
+
+    rig.run_configured(config, healthy).unwrap();
+
+    assert_eq!(rig.opcodes(), [PROBE, READ_BACK, FEED, FEED]);
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+#[test]
+fn a_panel_with_other_widgets_gets_one_e1_with_the_named_ones() {
+    let rig = Rig::new();
+    rig.panel_has(0xFF, 7);
+    let config = naming(0x05, 7, 2);
+
+    rig.run_configured(config, healthy).unwrap();
+
+    assert_eq!(rig.opcodes(), [PROBE, READ_BACK, DASHBOARD, FEED, FEED]);
+    assert_eq!(rig.device.panel.get(), (0x05, 7));
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+#[test]
+fn a_panel_with_another_interval_gets_one_e1_with_the_named_one() {
+    let rig = Rig::new();
+    rig.panel_has(0x05, 4);
+    let config = naming(0x05, 7, 2);
+
+    rig.run_configured(config, healthy).unwrap();
+
+    assert_eq!(rig.opcodes(), [PROBE, READ_BACK, DASHBOARD, FEED, FEED]);
+    assert_eq!(rig.device.panel.get(), (0x05, 7));
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+// Seen on the real panel: all eight widgets every 4 s, with no E1 from this tool.
+// Its selection is neither the defaults nor at the default interval.
+#[test]
+fn with_no_named_widgets_a_panel_with_widgets_is_left_alone() {
+    let rig = Rig::new();
+    rig.panel_has(0xFF, 4);
+
+    rig.ticks(3).unwrap();
+
+    assert_eq!(rig.opcodes(), [PROBE, READ_BACK, FEED, FEED, FEED]);
+    assert_eq!(rig.device.panel.get(), (0xFF, 4));
+    assert_only_allowed_frames(&rig.trace());
+}
+
+/// A read-back that fails until 7 seconds in sends no `E1` until then, and costs
+/// the normal backoff.
+fn assert_backs_off_without_e1(rig: &Rig) {
+    rig.ticks(1).unwrap();
+
+    let connections = [0, 2000, 6000, 14_000];
+    assert_eq!(rig.attempts(PROBE), connections);
+    assert_eq!(rig.attempts(READ_BACK), connections);
+    assert_eq!(rig.attempts(DASHBOARD), [14_000]);
+    assert_eq!(rig.delivered(FEED), [14_000]);
+    assert_only_allowed_frames(&rig.trace());
+}
+
+#[test]
+fn an_i2c_error_on_the_read_back_sends_no_e1_and_backs_off() {
+    let rig = Rig::new();
+    rig.read_fault(0, 7000, READ_BACK, eio);
+
+    assert_backs_off_without_e1(&rig);
+}
+
+#[test]
+fn a_short_read_back_sends_no_e1_and_backs_off() {
+    let rig = Rig::new();
+    rig.read_fault(0, 7000, READ_BACK, short_read);
+
+    assert_backs_off_without_e1(&rig);
+}
+
+#[test]
+fn a_failed_df_query_sends_no_e1_and_backs_off() {
+    let rig = Rig::new();
+    rig.fault(0, 7000, Some(READ_BACK), eio);
+
+    assert_backs_off_without_e1(&rig);
+}
+
+// The probe passing is no reason to retry at once: only a good E3 resets the
+// backoff, or this would hammer the panel with probes for as long as it lasts.
+#[test]
+fn a_panel_that_answers_the_probe_but_not_the_read_back_backs_off_to_the_cap() {
+    let rig = Rig::new();
+    rig.read_fault(0, TIME_LIMIT_MS, READ_BACK, short_read);
+    rig.stop_at(200_000);
+
+    rig.run(None, |_| Ok(healthy_sensors())).unwrap();
+
+    assert_eq!(
+        rig.attempts(PROBE),
+        [0, 2000, 6000, 14_000, 30_000, 62_000, 122_000, 182_000]
+    );
+    assert_eq!(rig.attempts(DASHBOARD), []);
+    assert_eq!(rig.attempts(FEED), []);
+}
+
+#[test]
+fn a_permission_error_on_the_read_back_is_fatal() {
+    let rig = Rig::new();
+    rig.read_fault(0, TIME_LIMIT_MS, READ_BACK, || errno_error(Errno::ACCESS));
+
+    let error = rig.run(None, no_sensors).unwrap_err();
+
+    assert!(matches!(error, Error::I2c { .. }), "{error:?}");
+    assert_eq!(rig.attempts(DASHBOARD), []);
+}
+
+#[test]
+fn a_reconnect_reads_back_again_and_a_panel_that_kept_its_widgets_gets_no_e1() {
+    let rig = Rig::new();
+    rig.outage(500, 3500);
+
+    rig.ticks(5).unwrap();
+
+    assert_eq!(rig.attempts(READ_BACK), [0, 5000]);
+    assert_eq!(rig.attempts(DASHBOARD), [0]);
+    assert_only_allowed_frames(&rig.trace());
+}
+
+#[test]
+fn a_reconnect_reads_back_again_and_a_panel_that_lost_its_widgets_gets_e1() {
+    let rig = Rig::new();
+    rig.panel_has(0xFF, 4);
+    rig.outage(500, 3500);
+    let device = rig.device.clone();
+    rig.clock.at(1500, move || device.panel.set((0, 0)));
+
+    rig.ticks(5).unwrap();
+
+    assert_eq!(rig.attempts(READ_BACK), [0, 5000]);
+    assert_eq!(rig.attempts(DASHBOARD), [5000]);
+    assert_only_allowed_frames(&rig.trace());
 }
 
 #[test]
@@ -512,7 +774,7 @@ fn the_feed_length_comes_from_the_config() {
         config,
         Environment {
             connect: || rig.connect(),
-            open_sensors: |_| Ok(healthy_sensors()),
+            open_sensors: healthy,
             clock: rig.clock.clone(),
             stop: rig.stop.clone(),
             dry_run: false,
@@ -671,6 +933,7 @@ fn a_good_write_clears_the_count_of_failures() {
 #[test]
 fn reconnect_backs_off_sends_e1_once_and_resets_after_a_good_write() {
     let rig = Rig::new();
+    rig.device.forgets_e1.set(true);
     rig.outage(2500, 20_000);
     rig.outage(36_500, 39_500);
 
@@ -709,7 +972,7 @@ fn a_short_read_counts_as_a_bus_error() {
     rig.ticks(7).unwrap();
 
     assert_eq!(rig.attempts(PROBE), [0, 7000]);
-    assert_eq!(rig.attempts(DASHBOARD), [0, 7000]);
+    assert_eq!(rig.attempts(READ_BACK), [0, 7000]);
 }
 
 #[test]
@@ -730,6 +993,7 @@ fn a_failed_e1_is_not_repeated_on_the_same_connection() {
 #[test]
 fn e1_does_not_count_as_a_good_write() {
     let rig = Rig::new();
+    rig.device.forgets_e1.set(true);
     rig.fault(500, TIME_LIMIT_MS, Some(FEED), eio);
 
     rig.ticks(15).unwrap();
@@ -1049,8 +1313,18 @@ fn shutdown_during_the_probe_does_not_go_on_to_e1() {
 
     rig.run(None, |_| Ok(healthy_sensors())).unwrap();
 
-    let opcodes: Vec<u8> = rig.trace().iter().map(Sent::opcode).collect();
-    assert_eq!(opcodes, [PROBE]);
+    assert_eq!(rig.opcodes(), [PROBE]);
+}
+
+#[test]
+fn shutdown_during_the_read_back_does_not_go_on_to_e1() {
+    let rig = Rig::new();
+    rig.device.write_cost.set(ms(10));
+    rig.stop_at(15);
+
+    rig.run(None, |_| Ok(healthy_sensors())).unwrap();
+
+    assert_eq!(rig.opcodes(), [PROBE, READ_BACK]);
 }
 
 #[test]
@@ -1077,6 +1351,7 @@ fn shutdown_during_a_sensor_read_sends_no_frame() {
 #[test]
 fn a_write_in_progress_finishes_before_shutdown() {
     let rig = Rig::new();
+    rig.panel_has(0xFF, 4);
     rig.device.write_cost.set(ms(10));
     rig.stop_at(1025);
 
@@ -1098,13 +1373,12 @@ fn zero_ticks_touches_nothing() {
 
 // Everything that can go wrong in one run: outages, a flapping feed, uploads,
 // failing sensors, a jump in time and a lost device. Whatever the order, the wire
-// only ever sees EB 03, one E1 per connection, and E3.
-#[test]
-fn no_forbidden_frame_in_a_full_trace() {
-    let rig = Rig::new();
+// only ever sees EB 03, DF, at most one E1 per connection, and E3.
+fn run_through_everything(rig: &Rig, config: DaemonConfig) {
     rig.outage(3500, 9000);
     rig.fault(20_500, 30_500, Some(FEED), eio);
-    rig.fault(40_000, 40_100, Some(DASHBOARD), eio);
+    rig.read_fault(30_000, 32_000, READ_BACK, short_read);
+    rig.fault(39_000, 39_100, Some(DASHBOARD), eio);
     rig.fault(45_500, 48_500, Some(FEED), short_read);
     rig.upload(60_500, 66_500);
     rig.outage(70_500, 75_500);
@@ -1114,7 +1388,7 @@ fn no_forbidden_frame_in_a_full_trace() {
     rig.stop_at(800_000);
     let opens = Rc::new(Cell::new(0));
 
-    rig.run(None, move |_| {
+    rig.run_configured(config, move |_| {
         opens.set(opens.get() + 1);
         if opens.get() % 3 == 0 {
             Ok(healthy_sensors())
@@ -1125,8 +1399,8 @@ fn no_forbidden_frame_in_a_full_trace() {
     .unwrap();
 
     let trace = rig.trace();
-    assert_only_allowed_frames(&trace);
-    let connections = rig.delivered(DASHBOARD).len();
+    assert_allowed_frames(&trace, config);
+    let connections = rig.delivered(READ_BACK).len();
     assert!(
         connections >= 4,
         "only {connections} connections: {trace:?}"
@@ -1136,6 +1410,55 @@ fn no_forbidden_frame_in_a_full_trace() {
     assert!(
         feed.windows(2).all(|pair| pair[1] - pair[0] >= 1000),
         "frames closer than a tick: {feed:?}"
+    );
+}
+
+#[test]
+fn no_forbidden_frame_when_the_panel_keeps_its_widgets() {
+    let rig = Rig::new();
+    rig.panel_has(0xFF, 4);
+
+    run_through_everything(&rig, DaemonConfig::default());
+
+    assert_eq!(rig.attempts(DASHBOARD), []);
+}
+
+#[test]
+fn no_forbidden_frame_when_the_panel_matches_the_named_widgets() {
+    let rig = Rig::new();
+    rig.panel_has(0x05, 7);
+    let config = DaemonConfig {
+        max_ticks: None,
+        ..naming(0x05, 7, 0)
+    };
+
+    run_through_everything(&rig, config);
+
+    assert_eq!(rig.attempts(DASHBOARD), []);
+}
+
+#[test]
+fn no_forbidden_frame_when_e1_is_needed_once() {
+    let rig = Rig::new();
+
+    run_through_everything(&rig, DaemonConfig::default());
+
+    assert_eq!(rig.delivered(DASHBOARD).len(), 1);
+}
+
+#[test]
+fn no_forbidden_frame_when_each_connection_needs_e1() {
+    let rig = Rig::new();
+    rig.device.forgets_e1.set(true);
+
+    run_through_everything(&rig, DaemonConfig::default());
+
+    let trace = rig.trace();
+    let answered = rig.delivered(READ_BACK).len();
+    assert_eq!(rig.attempts(DASHBOARD).len(), answered, "{trace:?}");
+    assert!(
+        rig.delivered(DASHBOARD).len() < answered,
+        "the failed E1 was not hit: {trace:?}"
     );
 }
 
@@ -1199,9 +1522,34 @@ fn dry_run_prints_the_feed_with_zeros_if_there_are_no_sensors() {
     let text = String::from_utf8(output.0.borrow().clone()).unwrap();
     let dashboards = text.lines().filter(|line| line.starts_with("E1 "));
     assert_eq!(dashboards.count(), 1, "{text}");
+    let read_backs = text.lines().filter(|line| line.starts_with("DF "));
+    assert_eq!(read_backs.count(), 1, "{text}");
     let feeds = text.lines().filter(|line| line.starts_with("E3 "));
     assert_eq!(feeds.count(), 3, "{text}");
     assert_eq!(rig.clock.elapsed_ms(), 2000);
+}
+
+#[test]
+fn dry_run_shows_df_says_a_real_run_decides_and_then_shows_the_default_e1() {
+    let rig = Rig::new();
+    let output = Output::default();
+
+    dry_run(&rig, Some(1), output.clone()).unwrap();
+
+    let text = String::from_utf8(output.0.borrow().clone()).unwrap();
+    let position = |needle: &str| text.find(needle).expect(needle);
+    assert!(
+        position("DF GetDisplay") < position("a real run decides"),
+        "{text}"
+    );
+    assert!(
+        position("a real run decides") < position("E1 SetDisplay"),
+        "{text}"
+    );
+    assert!(
+        text.contains("E1 CB 55 AC 38 01 01 01 01 00 01 00 01 03 00 00"),
+        "{text}"
+    );
 }
 
 #[test]

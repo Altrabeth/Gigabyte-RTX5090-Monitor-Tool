@@ -70,12 +70,13 @@ fn frames(text: &str, opcode: &str) -> usize {
 
 // `--max-ticks` is not passed: dry-run has to end by itself.
 #[test]
-fn daemon_dry_run_shows_the_probe_the_dashboard_and_three_ticks() {
+fn daemon_dry_run_shows_the_probe_the_read_back_the_dashboard_and_three_ticks() {
     let output = dry_run_daemon(&[]).output().unwrap();
 
     assert!(output.status.success(), "{output:?}");
     let text = stdout(&output);
     assert_eq!(frames(&text, "EB"), 1, "{text}");
+    assert_eq!(frames(&text, "DF"), 1, "{text}");
     assert_eq!(frames(&text, "E1"), 1, "{text}");
     assert_eq!(frames(&text, "E3"), 3, "{text}");
     assert_eq!(frames(&text, "AA"), 0, "{text}");
