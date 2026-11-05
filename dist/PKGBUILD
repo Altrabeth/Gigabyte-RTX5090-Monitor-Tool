@@ -1,0 +1,73 @@
+# Maintainer: Altrabeth <https://github.com/Altrabeth>
+
+pkgname=aorus-lcd
+_repo=Gigabyte-RTX5090-Monitor-Tool
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Drives the LCD Edge View panel of the Gigabyte AORUS RTX 5090 Master'
+arch=('x86_64')
+url="https://github.com/Altrabeth/$_repo"
+# The binary embeds DejaVu Sans Bold, so the font's terms apply to it as well as
+# MIT. SPDX has an id for Bitstream Vera but none for Arev, hence the LicenseRef.
+license=('MIT' 'Bitstream-Vera' 'LicenseRef-Arev')
+# nvidia-utils only at run time: NVML is loaded with dlopen, so it never shows up
+# as a linked library.
+depends=('gcc-libs' 'glibc' 'nvidia-utils')
+makedepends=('cargo')
+# Cargo's profile already strips the binary, so a debug package has no symbols.
+options=('!debug')
+backup=('etc/aorus-lcd.toml')
+install=aorus-lcd.install
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# Placeholder: the v0.1.0 tag does not exist yet. Replace this with the tarball's
+# real checksum (updpkgsums) once it does, before publishing.
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$_repo-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$_repo-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --release --locked --offline
+}
+
+check() {
+  cd "$_repo-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # These never touch hardware, but they read /etc/aorus-lcd.toml if it exists,
+  # so a broken one on the build machine fails them.
+  cargo test --release --locked --offline
+}
+
+package() {
+  cd "$_repo-$pkgver"
+
+  install -Dm755 target/release/aorus-lcd "$pkgdir/usr/bin/aorus-lcd"
+
+  # The unit in dist/ matches the README's manual install to /usr/local/bin. A
+  # package that kept that path would give a unit that cannot start, so stop here
+  # if the line ever changes shape and this sed misses it.
+  sed 's|^ExecStart=/usr/local/bin/aorus-lcd |ExecStart=/usr/bin/aorus-lcd |' \
+    dist/aorus-lcd.service > "$srcdir/aorus-lcd.service"
+  if ! grep -q '^ExecStart=/usr/bin/aorus-lcd ' "$srcdir/aorus-lcd.service"; then
+    echo 'package: failed to patch ExecStart in dist/aorus-lcd.service' >&2
+    return 1
+  fi
+  install -Dm644 "$srcdir/aorus-lcd.service" \
+    "$pkgdir/usr/lib/systemd/system/aorus-lcd.service"
+
+  install -Dm644 dist/aorus-lcd.sysusers "$pkgdir/usr/lib/sysusers.d/aorus-lcd.conf"
+  install -Dm644 dist/aorus-lcd.tmpfiles "$pkgdir/usr/lib/tmpfiles.d/aorus-lcd.conf"
+  install -Dm644 dist/i2c-dev.conf "$pkgdir/usr/lib/modules-load.d/i2c-dev.conf"
+  install -Dm644 dist/99-i2c.rules "$pkgdir/usr/lib/udev/rules.d/99-i2c.rules"
+  install -Dm644 dist/aorus-lcd.toml "$pkgdir/etc/aorus-lcd.toml"
+
+  install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" \
+    LICENSE assets/DejaVuSans-Bold.LICENSE
+}
