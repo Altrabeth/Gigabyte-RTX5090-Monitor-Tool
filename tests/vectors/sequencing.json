@@ -1,0 +1,100 @@
+{
+  "commit": "b7f1fa8",
+  "cases": [
+    {
+      "name": "send_upload_pacing",
+      "source": "tests/test_encoders.py::test_send_upload_pacing",
+      "lines": "419-427",
+      "stated": [
+        "frames = A.build_upload(b\"\\x33\" * 300, A.FB_STATIC)   # BEGIN,F1,c1,c2,END",
+        "A.send_upload(bus, frames)",
+        "assert bus.writes == frames",
+        "assert sleeps[:2] == [A.PACE_BEGIN, A.PACE_HEADER]",
+        "assert all(s == A.PACE_CHUNK for s in sleeps[2:])"
+      ],
+      "call": "send_upload",
+      "input": { "payload": [ { "hex": "33", "repeat": 300 } ], "fb_addr": "0x01300000" },
+      "expect": {
+        "writes_equal_upload_frames": true,
+        "first_sleeps_s": [0.5, 1.0],
+        "remaining_sleeps_each_s": 0.01
+      },
+      "note": "Sleep values are PACE_BEGIN, PACE_HEADER and PACE_CHUNK from aorus_lcd.py:58. The reference asserts no sleep count, so a delay after END is neither required nor forbidden."
+    },
+    {
+      "name": "upload_content_image_mode_after",
+      "source": "tests/test_encoders.py::test_upload_content_mode_ordering",
+      "lines": "430-437",
+      "stated": [
+        "frames = A.build_upload(b\"\\x44\" * 300, A.FB_STATIC)",
+        "# image/text: SetMode AFTER the upload",
+        "A.upload_content(bus, frames, A.MODE_STATIC, is_gif=False)",
+        "assert bus.writes[-1][0] == 0xE5 and bus.writes[-1][5] == A.MODE_STATIC + 1",
+        "assert bus.writes[:-1] == frames"
+      ],
+      "call": "upload_content",
+      "input": {
+        "payload": [ { "hex": "44", "repeat": 300 } ],
+        "fb_addr": "0x01300000",
+        "mode": 3,
+        "is_gif": false
+      },
+      "expect": {
+        "before_upload": [],
+        "after_upload": [
+          { "at": [ { "offset": 0, "hex": "e5" }, { "offset": 5, "u8": [4] } ] }
+        ]
+      },
+      "note": "The mode byte is the stated MODE_STATIC + 1. The writes between before_upload and after_upload equal the upload frames."
+    },
+    {
+      "name": "upload_content_gif_mode_before",
+      "source": "tests/test_encoders.py::test_upload_content_mode_ordering",
+      "lines": "430-442",
+      "stated": [
+        "frames = A.build_upload(b\"\\x44\" * 300, A.FB_STATIC)",
+        "# gif: SetMode BEFORE streaming (fb 0 is a live buffer)",
+        "A.upload_content(bus, frames, A.MODE_GIF, is_gif=True)",
+        "assert bus.writes[0][0] == 0xE5 and bus.writes[0][5] == A.MODE_GIF + 1",
+        "assert bus.writes[1:] == frames"
+      ],
+      "call": "upload_content",
+      "input": {
+        "payload": [ { "hex": "44", "repeat": 300 } ],
+        "fb_addr": "0x01300000",
+        "mode": 5,
+        "is_gif": true
+      },
+      "expect": {
+        "before_upload": [
+          { "at": [ { "offset": 0, "hex": "e5" }, { "offset": 5, "u8": [6] } ] }
+        ],
+        "after_upload": []
+      },
+      "note": "The mode byte is the stated MODE_GIF + 1. The reference reuses the FB_STATIC frames because this case tests ordering only; a real gif uses FB_GIF."
+    },
+    {
+      "name": "upload_content_no_mode",
+      "source": "tests/test_encoders.py::test_upload_content_mode_ordering",
+      "lines": "430-446",
+      "stated": [
+        "frames = A.build_upload(b\"\\x44\" * 300, A.FB_STATIC)",
+        "# --no-mode: upload only",
+        "A.upload_content(bus, frames, A.MODE_STATIC, is_gif=False, set_display_mode=False)",
+        "assert bus.writes == frames"
+      ],
+      "call": "upload_content",
+      "input": {
+        "payload": [ { "hex": "44", "repeat": 300 } ],
+        "fb_addr": "0x01300000",
+        "mode": 3,
+        "is_gif": false,
+        "set_display_mode": false
+      },
+      "expect": {
+        "before_upload": [],
+        "after_upload": []
+      }
+    }
+  ]
+}

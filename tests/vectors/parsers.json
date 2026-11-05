@@ -1,0 +1,41 @@
+{
+  "commit": "b7f1fa8",
+  "cases": [
+    {
+      "name": "parse_hex_bytes_spaces",
+      "source": "tests/test_encoders.py::test_parse_hex_bytes",
+      "lines": "481-483",
+      "stated": [ "assert A.parse_hex_bytes(\"aa 01 02\") == bytes([0xAA, 0x01, 0x02])" ],
+      "call": "parse_hex_bytes",
+      "input": { "text": "aa 01 02" },
+      "expect": { "exact": "aa 01 02" }
+    },
+    {
+      "name": "parse_hex_bytes_comma",
+      "source": "tests/test_encoders.py::test_parse_hex_bytes",
+      "lines": "481-483",
+      "stated": [ "assert A.parse_hex_bytes(\"eb,03\") == bytes([0xEB, 0x03])" ],
+      "call": "parse_hex_bytes",
+      "input": { "text": "eb,03" },
+      "expect": { "exact": "eb 03" }
+    },
+    {
+      "name": "parse_color_bare",
+      "source": "tests/test_encoders.py::test_parse_color",
+      "lines": "486-488",
+      "stated": [ "assert A.parse_color(\"ff8000\") == (255, 128, 0)" ],
+      "call": "parse_color",
+      "input": { "text": "ff8000" },
+      "expect": { "rgb": [255, 128, 0] }
+    },
+    {
+      "name": "parse_color_hash",
+      "source": "tests/test_encoders.py::test_parse_color",
+      "lines": "486-488",
+      "stated": [ "assert A.parse_color(\"#ff8000\") == (255, 128, 0)" ],
+      "call": "parse_color",
+      "input": { "text": "#ff8000" },
+      "expect": { "rgb": [255, 128, 0] }
+    }
+  ]
+}

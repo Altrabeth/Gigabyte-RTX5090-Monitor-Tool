@@ -1,0 +1,197 @@
+{
+  "commit": "b7f1fa8",
+  "generators": {
+    "write_test_gif": {
+      "source": "tests/test_encoders.py::_write_test_gif",
+      "lines": "115-127",
+      "stated": [
+        "def _write_test_gif(path, nframes=7):",
+        "im = Image.new(\"RGB\", (A.W, A.H), (12 * i, 0, 120))",
+        "for x in range(48):",
+        "for y in range(48):",
+        "im.putpixel(((i * 41 + x) % A.W, (40 + y) % A.H),",
+        "(255, 255 - 30 * i, 33 * i % 256))",
+        "duration=50, loop=0)"
+      ],
+      "width": 320,
+      "height": 170,
+      "nframes": 7,
+      "block_size": 48,
+      "duration_ms": 50,
+      "loop": 0,
+      "note": "A recipe, not a file. Pillow writes the real GIF at test time and its palette output cannot be reproduced without running it, so no byte value downstream of this GIF is a vector."
+    }
+  },
+  "cases": [
+    {
+      "name": "rle_round_trip_lcg_frame",
+      "source": "tests/test_encoders.py::test_rle_round_trip_random_ish",
+      "lines": "187-195",
+      "stated": [
+        "v = 12345",
+        "for _ in range(A.FRAME_PIXELS):",
+        "v = (v * 1103515245 + 12345) & 0x7FFFFFFF",
+        "px += ((v >> 7) & 0xFFFF).to_bytes(2, \"little\")",
+        "assert _rle_decode(A.rle_encode_frame(px)) == px"
+      ],
+      "call": "rle_round_trip",
+      "input": {
+        "generator": {
+          "seed": 12345,
+          "multiplier": 1103515245,
+          "increment": 12345,
+          "state_mask": "0x7FFFFFFF",
+          "pixel_shift": 7,
+          "pixel_mask": "0xFFFF",
+          "pixels": 54400
+        }
+      },
+      "expect": { "decodes_to_input": true },
+      "note": "Build the frame with common::lcg_frame and decode with common::rle_decode. The encoded bytes are not stated, only that they decode back."
+    },
+    {
+      "name": "render_text_hello",
+      "source": "tests/test_encoders.py::test_render_text_le565",
+      "lines": "108-112",
+      "stated": [
+        "out = A.render_text_le565(\"HELLO\", size=28, fg=(255, 255, 255), bg=(0, 0, 0))",
+        "assert len(out) == A.FRAME_BYTES",
+        "assert b\"\\xff\\xff\" in out, \"some white text pixels\"",
+        "assert out[:2] == b\"\\x00\\x00\", \"corner stays background\""
+      ],
+      "call": "render_text_le565",
+      "input": { "text": "HELLO", "size": 28, "fg": [255, 255, 255], "bg": [0, 0, 0] },
+      "expect": {
+        "len": 108800,
+        "at": [ { "offset": 0, "hex": "00 00" } ],
+        "contains": "ff ff"
+      },
+      "note": "Pixels depend on the font and rasterizer, so only these properties carry over."
+    },
+    {
+      "name": "gif_to_le565_frames",
+      "source": "tests/test_encoders.py::test_gif_to_le565_frames",
+      "lines": "130-136",
+      "stated": [
+        "frames, delays = A.gif_to_le565_frames(p)",
+        "assert len(frames) == len(delays) == 7",
+        "assert all(len(f) == A.FRAME_BYTES for f in frames)",
+        "assert delays == [50] * 7"
+      ],
+      "call": "gif_to_le565_frames",
+      "input": { "generator": "write_test_gif" },
+      "expect": { "frame_count": 7, "frame_len": 108800, "delays_ms": [50, 50, 50, 50, 50, 50, 50] }
+    },
+    {
+      "name": "gif_payload_self_consistent",
+      "source": "tests/test_encoders.py::test_gif_payload_self_consistent",
+      "lines": "229-244",
+      "stated": [
+        "payload, n, d = A.build_gif_payload(p)",
+        "assert n == 7",
+        "assert d == 50, \"header delay = average gif frame duration in ms\"",
+        "assert struct.unpack_from(\"<H\", payload, 0)[0] == 7",
+        "pos = cum = 2 + 10 * n",
+        "u32, w, h, t = struct.unpack_from(\"<IHHH\", payload, 2 + 10 * i)",
+        "size = _walk_rle_frame(payload, pos)",
+        "cum += size",
+        "assert u32 == cum - 1, f\"frame {i} end offset\"",
+        "assert (w, h, t) == (A.W, A.H, 3)",
+        "pos += size",
+        "assert pos == len(payload), \"no leftover bytes\""
+      ],
+      "call": "build_gif_payload",
+      "input": { "generator": "write_test_gif" },
+      "expect": {
+        "frame_count": 7,
+        "header_delay_ms": 50,
+        "table_u16_count": 7,
+        "entry_width": 320,
+        "entry_height": 170,
+        "entry_fmt": 3,
+        "end_offsets_are_inclusive_and_cumulative": true,
+        "no_leftover_bytes": true
+      },
+      "note": "Each blob covers exactly FRAME_PIXELS pixels (_walk_rle_frame, lines 216-226). End offsets depend on blob sizes, so they are checked by walking the payload, not stated."
+    },
+    {
+      "name": "build_gif_frames_wraps_payload",
+      "source": "tests/test_encoders.py::test_build_gif_frames_wraps_payload",
+      "lines": "247-262",
+      "stated": [
+        "frames, n = A.build_gif_frames(p)",
+        "assert n == 7",
+        "assert frames[0][:6] == F2 + b\"\\x01\" and frames[-1][:6] == F2 + b\"\\x02\"",
+        "hdr = frames[1]",
+        "assert hdr[0] == 0xF1 and hdr[9] == 2, \"gif flag\"",
+        "assert int.from_bytes(hdr[14:16], \"big\") == n",
+        "body = b\"\".join(frames[2:-1])",
+        "nchunks = len(payload) // 256 + 1",
+        "assert int.from_bytes(hdr[10:14], \"big\") == nchunks",
+        "assert len(body) == nchunks * 256",
+        "assert body[:len(payload)] == payload",
+        "assert not any(body[len(payload):])"
+      ],
+      "call": "build_gif_frames",
+      "input": { "generator": "write_test_gif" },
+      "expect": {
+        "frame_count": 7,
+        "items": [
+          { "index": 0, "at": [ { "offset": 0, "hex": "f2 cb 55 ac 38 01" } ] },
+          {
+            "index": 1,
+            "at": [
+              { "offset": 0, "hex": "f1" },
+              { "offset": 9, "u8": [2] },
+              { "offset": 14, "u16be": [7] }
+            ]
+          },
+          { "index": -1, "at": [ { "offset": 0, "hex": "f2 cb 55 ac 38 02" } ] }
+        ],
+        "chunk_count_is_len_div_256_plus_1": true,
+        "body_is_payload_then_zero_padding": true
+      }
+    },
+    {
+      "name": "probe_is_a_status_query",
+      "source": "tests/test_encoders.py::test_probe_is_a_status_query_not_a_quick_write",
+      "lines": "390-399",
+      "stated": [
+        "# Regression: the NVIDIA adapter EIOs 0-length \"quick\" writes even with the",
+        "# panel present, and unconnected DDC ports falsely ACK them. probe() must",
+        "# instead require a successful EB 03 read-back.",
+        "ok, detail = A.probe(0)",
+        "assert ok",
+        "assert fake.writes[0][0] == 0xEB and fake.reads == 1",
+        "assert \"0x61\" in detail"
+      ],
+      "call": "probe",
+      "input": { "fail_read": false },
+      "expect": {
+        "ok": true,
+        "first_write_opcode": "0xEB",
+        "reads": 1,
+        "detail_contains": "0x61"
+      },
+      "note": "detail is human-readable text from the reference CLI, not a wire format."
+    },
+    {
+      "name": "probe_fails_when_readback_fails",
+      "source": "tests/test_encoders.py::test_probe_fails_when_readback_fails",
+      "lines": "402-407",
+      "stated": [
+        "fake = FakeStatusBus(fail_read=True)",
+        "ok, detail = A.probe(0)",
+        "assert not ok",
+        "assert \"no response\" in detail"
+      ],
+      "call": "probe",
+      "input": { "fail_read": true },
+      "expect": {
+        "ok": false,
+        "detail_contains": "no response"
+      },
+      "note": "detail is human-readable text from the reference CLI, not a wire format."
+    }
+  ]
+}
