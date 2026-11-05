@@ -14,6 +14,7 @@
 //! match arm in `main.rs`.
 
 pub mod carousel;
+pub mod daemon;
 pub mod dashboard;
 pub mod mode;
 pub mod off;

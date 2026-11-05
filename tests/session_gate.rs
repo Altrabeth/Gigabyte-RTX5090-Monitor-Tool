@@ -296,7 +296,10 @@ fn a_refused_adapter_stops_before_the_lock_and_the_device() {
 
     let result = rig.connect(&options, spy.clone());
 
-    assert!(matches!(result, Err(Error::Adapter(_))), "{result:?}");
+    assert!(
+        matches!(result, Err(Error::AdapterRefused(_))),
+        "{result:?}"
+    );
     assert!(!rig.lock_path().exists());
     assert!(rig.opened.borrow().is_empty());
     assert!(spy.delays.borrow().is_empty(), "a refusal is never retried");

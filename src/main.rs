@@ -60,6 +60,8 @@ enum Command {
     Dashboard(commands::dashboard::Args),
     /// Cycle through display modes
     Carousel(commands::carousel::Args),
+    /// Keep the panel's sensor feed running
+    Daemon(commands::daemon::Args),
     /// Select the display mode
     Mode(commands::mode::Args),
     /// Turn the panel off
@@ -82,6 +84,7 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Dashboard(args) => commands::dashboard::run(args, &cli.globals),
         Command::Carousel(args) => commands::carousel::run(args, &cli.globals),
+        Command::Daemon(args) => commands::daemon::run(args, &cli.globals),
         Command::Mode(args) => commands::mode::run(args, &cli.globals),
         Command::Off(args) => commands::off::run(args, &cli.globals),
         Command::On(args) => commands::on::run(args, &cli.globals),
