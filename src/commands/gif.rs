@@ -5,6 +5,9 @@
 //! byte, see [`aorus_lcd::image`]. And pixels no frame has drawn are black here,
 //! because the `image` crate leaves them fully transparent and alpha is dropped,
 //! where Pillow takes the colour from the palette.
+//!
+//! One difference is deliberate: the first frame is sent twice, see
+//! [`with_first_frame_repeated`].
 
 use std::cmp::Ordering;
 use std::fs;
@@ -21,12 +24,16 @@ use aorus_lcd::{rle, Error, Result};
 
 use super::upload;
 
-/// The most frames this command sends. This is a conservative cap, not a known
-/// firmware limit: `MaxFrames` in `GifDecoder.cs` has the same value, its comment
-/// says it guards against exhausting memory, and only its error message calls it
-/// a panel limit. Nothing above it has been shown to work, and uploads land in
-/// panel memory that is not understood.
+/// The most frames this command sends, the repeated first frame included. This is
+/// a conservative cap, not a known firmware limit: `MaxFrames` in `GifDecoder.cs`
+/// has the same value, its comment says it guards against exhausting memory, and
+/// only its error message calls it a panel limit. Nothing above it has been shown
+/// to work, and uploads land in panel memory that is not understood.
 const MAX_FRAMES: usize = 256;
+
+/// The most frames a GIF may have: one less than [`MAX_FRAMES`], because
+/// [`with_first_frame_repeated`] adds a frame.
+const MAX_SOURCE_FRAMES: usize = MAX_FRAMES - 1;
 
 /// The delay of a frame with no graphic control extension. The default of
 /// `im.info.get("duration", 100)` in `gif_to_le565_frames`.
@@ -70,8 +77,10 @@ pub struct Args {
 #[derive(Debug)]
 struct Prepared {
     payload: Vec<u8>,
-    frame_count: u16,
-    /// The delay of each frame in milliseconds. Never empty.
+    /// How many frames `payload` holds, which is one more than the GIF has.
+    sent_frames: u16,
+    /// The delay of each frame of the GIF in milliseconds, without the repeat.
+    /// Never empty.
     delays_ms: Vec<u32>,
 }
 
@@ -83,11 +92,14 @@ pub fn run(args: Args, globals: &crate::Globals) -> Result<()> {
     let delay_ms = args
         .frame_delay
         .unwrap_or_else(|| header_delay(&gif.delays_ms));
-    let params = UploadParams::gif(gif.frame_count, delay_ms);
+    let params = UploadParams::gif(gif.sent_frames, delay_ms);
 
     let pauses = estimated_upload_pauses(&gif.payload, &params, UploadOptions::default())?;
     // On stderr, which leaves the dry-run dump on stdout to the frames alone.
-    eprintln!("{}", summary(gif.frame_count, gif.payload.len(), pauses));
+    eprintln!(
+        "{}",
+        summary(gif.delays_ms.len(), gif.payload.len(), pauses)
+    );
     upload::send(&gif.payload, &params, false, globals)
 }
 
@@ -110,9 +122,10 @@ fn prepare(path: &Path) -> Result<Prepared> {
 
     let delays_ms = frame_delays_ms(&data);
     // Before any frame is decoded, so that an oversized GIF is refused at once.
-    if delays_ms.len() > MAX_FRAMES {
+    if delays_ms.len() > MAX_SOURCE_FRAMES {
         return Err(Error::InvalidArgument(format!(
-            "{} has {} frames, and at most {MAX_FRAMES} are sent to the panel",
+            "{} has {} frames, and at most {MAX_SOURCE_FRAMES} are accepted: the panel \
+             gets at most {MAX_FRAMES}, and the first frame is sent twice",
             path.display(),
             delays_ms.len()
         )));
@@ -131,14 +144,34 @@ fn prepare(path: &Path) -> Result<Prepared> {
         )));
     }
 
+    let sent = with_first_frame_repeated(&blobs);
     Ok(Prepared {
         // This also refuses a GIF with no frames, which keeps `delays_ms` from
         // being empty.
-        payload: rle::gif_payload(&blobs)?,
+        payload: rle::gif_payload(&sent)?,
         // `gif_payload` proved that the count fits.
-        frame_count: blobs.len() as u16,
+        sent_frames: sent.len() as u16,
         delays_ms,
     })
+}
+
+/// The blobs to send: all of them, with the first one twice.
+///
+/// Firmware 1.3 on the RTX 5090 Master never shows the first frame of a GIF. Two
+/// uploads with unrelated content lost it: four labelled colour blocks showed 2 to
+/// 4, and five digits showed 2 to 5. So this goes by position and not by content,
+/// and decoding what we sent found frame 1 correct. The copy absorbs the skip.
+///
+/// This is a workaround for observed behaviour, not documented protocol, and
+/// neither reference mentions it. It lives here because it is a choice of what to
+/// send: [`rle::gif_payload`] stays byte-identical to `build_gif_payload`.
+fn with_first_frame_repeated(blobs: &[Vec<u8>]) -> Vec<&[u8]> {
+    blobs
+        .first()
+        .into_iter()
+        .chain(blobs)
+        .map(Vec::as_slice)
+        .collect()
 }
 
 /// Turns one composited frame into its RLE blob. `into_frames` has already
@@ -241,8 +274,10 @@ fn round_half_even(numerator: u64, denominator: u64) -> u64 {
     }
 }
 
-/// `pauses` leaves out the time on the bus, which is why this says "at least".
-fn summary(frames: u16, payload_bytes: usize, pauses: Duration) -> String {
+/// `frames` are those of the GIF, while `payload_bytes` is what is really sent, the
+/// repeated first frame included. `pauses` leaves out the time on the bus, which is
+/// why this says "at least".
+fn summary(frames: usize, payload_bytes: usize, pauses: Duration) -> String {
     let seconds = pauses.as_secs_f64().ceil() as u64;
     let time = match (seconds / 60, seconds % 60) {
         (0, seconds) => format!("{seconds} s"),

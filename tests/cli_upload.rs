@@ -10,6 +10,10 @@
 //! expected bytes are worked out by hand from `docs/PROTOCOL.md` section 6. For
 //! the RLE: 54400 pixels make one window of 0x7FFF and one of 0x5481, so a solid
 //! frame is two runs, `FF FF <px> 81 D4 <px>`, of 8 bytes.
+//!
+//! A GIF of N frames goes out as N + 1, because the first frame is sent twice to
+//! make up for the panel skipping it. The table of N + 1 frames is 2 + 10(N + 1)
+//! bytes, so every end offset below counts the first blob twice.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -362,8 +366,8 @@ fn a_gif_header_is_framebuffer_flag_chunks_frames_delay_and_mode() {
     assert_eq!(
         f1_rows(&dump),
         [
-            // Framebuffer 0, flag 2, one chunk, two frames.
-            "F1 CB 55 AC 38 00 00 00 00 02 00 00 00 01 00 02",
+            // Framebuffer 0, flag 2, one chunk, and three frames for a GIF of two.
+            "F1 CB 55 AC 38 00 00 00 00 02 00 00 00 01 00 03",
             // 40 ms, and mode 2 although the payload is far under 20480 bytes.
             "28 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
             ZERO_ROW,
@@ -381,14 +385,17 @@ fn a_gif_payload_is_the_table_then_the_blobs() {
     let dump = gif_dump(&images, &["-v"]);
 
     assert_eq!(
-        rows_after(&dump, "payload chunk", 0, 3),
+        rows_after(&dump, "payload chunk", 0, 4),
         [
-            // Two frames, then frame 0 ending at 2 + 20 + 8 - 1 = 0x1D, 320, 170, 3.
-            // Frame 1 ends at 2 + 20 + 16 - 1 = 0x25.
-            "02 00 1D 00 00 00 40 01 AA 00 03 00 25 00 00 00",
-            // The rest of that entry, red, then the start of blue.
-            "40 01 AA 00 03 00 FF FF 00 F8 81 D4 00 F8 FF FF",
-            "1F 00 81 D4 1F 00 00 00 00 00 00 00 00 00 00 00",
+            // Three frames, then frame 0 ending at 2 + 30 + 8 - 1 = 0x27, 320, 170, 3.
+            // Frame 1 ends at 2 + 30 + 16 - 1 = 0x2F.
+            "03 00 27 00 00 00 40 01 AA 00 03 00 2F 00 00 00",
+            // The rest of that entry, and frame 2 ending at 2 + 30 + 24 - 1 = 0x37.
+            "40 01 AA 00 03 00 37 00 00 00 40 01 AA 00 03 00",
+            // Red, and the same red again.
+            "FF FF 00 F8 81 D4 00 F8 FF FF 00 F8 81 D4 00 F8",
+            // Blue, which is the GIF's second frame, and the padding.
+            "FF FF 1F 00 81 D4 1F 00 00 00 00 00 00 00 00 00",
         ]
     );
 }
@@ -407,13 +414,14 @@ fn a_gif_frame_is_composited_over_the_last_one() {
     let dump = gif_dump(&[Image::delayed(4), patch], &["-v"]);
 
     assert_eq!(
-        rows_after(&dump, "payload chunk", 0, 3),
+        rows_after(&dump, "payload chunk", 0, 4),
         [
-            // The second blob is 16 bytes, so frame 1 ends at 2 + 20 + 24 - 1 = 0x2D.
-            "02 00 1D 00 00 00 40 01 AA 00 03 00 2D 00 00 00",
-            "40 01 AA 00 03 00 FF FF 00 F8 81 D4 00 F8 03 00",
+            "03 00 27 00 00 00 40 01 AA 00 03 00 2F 00 00 00",
+            // The GIF's second frame is 16 bytes, so it ends at 2 + 30 + 32 - 1 = 0x3F.
+            "40 01 AA 00 03 00 3F 00 00 00 40 01 AA 00 03 00",
+            "FF FF 00 F8 81 D4 00 F8 FF FF 00 F8 81 D4 00 F8",
             // A literal of 3, a run of 0x7FFC to the window's end, then 0x5481.
-            "00 F8 1F 00 1F 00 FC FF 00 F8 81 D4 00 F8 00 00",
+            "03 00 00 F8 1F 00 1F 00 FC FF 00 F8 81 D4 00 F8",
         ]
     );
 }
@@ -433,13 +441,14 @@ fn a_gif_frame_honours_the_disposal_of_the_last_one() {
     let dump = gif_dump(&[cleared, patch], &["-v"]);
 
     assert_eq!(
-        rows_after(&dump, "payload chunk", 0, 3),
+        rows_after(&dump, "payload chunk", 0, 4),
         [
-            // The second blob is 14 bytes, so frame 1 ends at 2 + 20 + 22 - 1 = 0x2B.
-            "02 00 1D 00 00 00 40 01 AA 00 03 00 2B 00 00 00",
-            "40 01 AA 00 03 00 FF FF 00 F8 81 D4 00 F8 02 00",
+            "03 00 27 00 00 00 40 01 AA 00 03 00 2F 00 00 00",
+            // The GIF's second frame is 14 bytes, so it ends at 2 + 30 + 30 - 1 = 0x3D.
+            "40 01 AA 00 03 00 3D 00 00 00 40 01 AA 00 03 00",
+            "FF FF 00 F8 81 D4 00 F8 FF FF 00 F8 81 D4 00 F8",
             // A literal of black and blue, a run of 0x7FFD, then 0x5481.
-            "00 00 1F 00 FD FF 00 00 81 D4 00 00 00 00 00 00",
+            "02 00 00 00 1F 00 FD FF 00 00 81 D4 00 00 00 00",
         ]
     );
 }
@@ -458,15 +467,43 @@ fn a_gif_of_any_size_becomes_full_frames() {
     let dump = dump_of(&["-v", "gif", text(&path)]);
 
     assert_eq!(
-        rows_after(&dump, "payload chunk", 0, 1),
-        ["01 00 13 00 00 00 40 01 AA 00 03 00 FF FF 00 F8"]
+        rows_after(&dump, "payload chunk", 0, 2),
+        [
+            "02 00 1D 00 00 00 40 01 AA 00 03 00 25 00 00 00",
+            "40 01 AA 00 03 00 FF FF 00 F8 81 D4 00 F8 FF FF",
+        ]
+    );
+}
+
+#[test]
+fn a_gif_of_one_frame_goes_out_as_two() {
+    let dump = gif_dump(&[Image::solid(BLUE, Some((4, 0, false)))], &["-v"]);
+
+    // One chunk and two frames. The delay is that of the one frame in the file.
+    assert_eq!(
+        f1_rows(&dump)[..2],
+        [
+            "F1 CB 55 AC 38 00 00 00 00 02 00 00 00 01 00 02",
+            &delay_row("28"),
+        ]
+    );
+    assert_eq!(
+        rows_after(&dump, "payload chunk", 0, 3),
+        [
+            // Two frames, ending at 2 + 20 + 8 - 1 = 0x1D and 2 + 20 + 16 - 1 = 0x25.
+            "02 00 1D 00 00 00 40 01 AA 00 03 00 25 00 00 00",
+            // The rest of that entry, the blob, and the start of its copy.
+            "40 01 AA 00 03 00 FF FF 1F 00 81 D4 1F 00 FF FF",
+            "1F 00 81 D4 1F 00 00 00 00 00 00 00 00 00 00 00",
+        ]
     );
 }
 
 #[test]
 fn the_gif_delay_is_the_mean_rounded_to_even() {
     let cases: [(&[u16], &str); 4] = [
-        // Hundredths of a second, so tens of milliseconds.
+        // Hundredths of a second, so tens of milliseconds. The first frame is sent
+        // twice but counted once: with it twice, 37.5 would be 36 and 26.67 would be 25.
         (&[1, 1, 1, 2], "0C"), // 12.5 ms goes down to 12
         (&[3, 4, 4, 4], "26"), // 37.5 ms goes up to 38
         (&[2, 3, 3], "1B"),    // 26.67 ms goes to 27
@@ -520,10 +557,11 @@ fn a_gif_says_what_the_upload_will_take_and_shows_no_progress() {
 
     assert!(output.status.success(), "{output:?}");
     // 200 ms to settle, 500 and 1000 for the marker and the header, and 10 each
-    // for the chunk and END: 1.72 s.
+    // for the chunk and END: 1.72 s. The two frames are those of the file, and the
+    // bytes are what is sent, with three blobs: 2 + 30 + 24 = 56.
     assert_eq!(
         stderr(&output),
-        "2 frames, 38 bytes: the upload takes at least 2 s\n"
+        "2 frames, 56 bytes: the upload takes at least 2 s\n"
     );
 }
 
@@ -574,16 +612,22 @@ fn tiny_frame(pixel: u8) -> Image {
 }
 
 #[test]
-fn a_gif_of_256_frames_is_sent() {
+fn a_gif_of_255_frames_is_sent_as_256() {
     let dir = tempfile::tempdir().unwrap();
-    let images: Vec<Image> = (0..256).map(|_| tiny_frame(RED)).collect();
+    let images: Vec<Image> = (0..255).map(|_| tiny_frame(RED)).collect();
     let path = write_file(&dir, "a.gif", &gif_bytes((1, 1), &images));
 
-    let dump = dump_of(&["gif", text(&path)]);
+    let output = dry_run(&["gif", text(&path)]);
 
+    assert!(output.status.success(), "{output:?}");
+    let dump = stdout(&output);
     // 2 + 2560 + 256 * 8 = 4610 bytes, so 18 full chunks and one more. With the
     // probe, `E5`, both markers and the header, that is 24.
     assert_eq!(frame_sequence(&dump).len(), 24, "{dump}");
+    assert!(
+        stderr(&output).starts_with("255 frames, 4610 bytes:"),
+        "{output:?}"
+    );
     assert_eq!(
         f1_rows(&dump),
         [
@@ -596,12 +640,16 @@ fn a_gif_of_256_frames_is_sent() {
 }
 
 #[test]
-fn a_gif_of_257_frames_is_refused_before_the_probe() {
+fn a_gif_of_256_frames_is_refused_before_the_probe() {
     let dir = tempfile::tempdir().unwrap();
-    let images: Vec<Image> = (0..257).map(|_| tiny_frame(RED)).collect();
+    let images: Vec<Image> = (0..256).map(|_| tiny_frame(RED)).collect();
     let path = write_file(&dir, "a.gif", &gif_bytes((1, 1), &images));
 
-    assert_refused(&["gif", text(&path)], "has 257 frames, and at most 256");
+    assert_refused(
+        &["gif", text(&path)],
+        "has 256 frames, and at most 255 are accepted: the panel gets at most 256, \
+         and the first frame is sent twice",
+    );
 }
 
 /// An image whose only code is one that the LZW table does not hold yet.
@@ -624,10 +672,10 @@ fn a_gif_with_a_frame_that_will_not_decode_is_refused_before_the_probe() {
 fn too_many_frames_are_refused_without_decoding_any() {
     let dir = tempfile::tempdir().unwrap();
     let mut images = vec![tiny_frame(RED), undecodable_frame()];
-    images.extend((0..255).map(|_| tiny_frame(RED)));
+    images.extend((0..254).map(|_| tiny_frame(RED)));
     let path = write_file(&dir, "a.gif", &gif_bytes((1, 1), &images));
 
-    assert_refused(&["gif", text(&path)], "has 257 frames, and at most 256");
+    assert_refused(&["gif", text(&path)], "has 256 frames, and at most 255");
 }
 
 #[test]
