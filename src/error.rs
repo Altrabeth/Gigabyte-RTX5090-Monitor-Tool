@@ -76,6 +76,17 @@ pub enum Error {
         path: PathBuf,
     },
 
+    /// A command that needs the bus to itself could not have it. `hint` says what
+    /// to do about that. It is separate from [`Error::LockBusy`], which the daemon
+    /// also meets, where advice to stop the daemon would be nonsense.
+    #[error("{hint}")]
+    BusBusy {
+        /// What to do about it.
+        hint: String,
+        /// The [`Error::LockBusy`] behind this.
+        source: Box<Error>,
+    },
+
     /// A caller-supplied value was rejected. Validate before touching the bus.
     #[error("{0}")]
     InvalidArgument(String),

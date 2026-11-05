@@ -23,6 +23,7 @@ pub mod mode;
 pub mod off;
 pub mod on;
 pub mod probe;
+pub mod recover;
 pub mod save;
 pub mod status;
 pub mod text;
