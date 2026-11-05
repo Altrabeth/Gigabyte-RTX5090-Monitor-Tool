@@ -234,7 +234,7 @@ fn power_frames_have_the_exact_layout() {
 
 #[test]
 fn every_mode_has_its_exact_wire_byte() {
-    let expected: [(Mode, u8); 8] = [
+    let expected: [(Mode, u8); 9] = [
         (Mode::Faith1, 0x01),
         (Mode::Faith2, 0x02),
         (Mode::Faith3, 0x03),
@@ -243,6 +243,7 @@ fn every_mode_has_its_exact_wire_byte() {
         (Mode::Gif, 0x06),
         (Mode::ChibiClock, 0x07),
         (Mode::Carousel, 0x0A),
+        (Mode::PresetRotation, 0x0B),
     ];
     for (mode, byte) in expected {
         assert_eq!(
@@ -254,11 +255,20 @@ fn every_mode_has_its_exact_wire_byte() {
 }
 
 #[test]
-fn only_modes_up_to_7_exist() {
-    for number in 0..=7u8 {
+fn e5_preset_rotation_is_0x0b_and_not_number_plus_one() {
+    let mut expected = vec![0u8; 256];
+    expected[..6].copy_from_slice(&[0xE5, 0xCB, 0x55, 0xAC, 0x38, 0x0B]);
+
+    assert_eq!(mode_frame(Mode::PresetRotation).to_vec(), expected);
+    assert_eq!(Mode::try_from(8).unwrap(), Mode::PresetRotation);
+}
+
+#[test]
+fn only_modes_up_to_8_exist() {
+    for number in 0..=8u8 {
         assert_eq!(Mode::try_from(number).unwrap().number(), number);
     }
-    for number in 8..=255u8 {
+    for number in 9..=255u8 {
         assert!(
             matches!(Mode::try_from(number), Err(Error::InvalidArgument(_))),
             "{number}"
@@ -594,11 +604,14 @@ fn f3_has_the_exact_layout_for_all_carousel_modes() {
 }
 
 #[test]
-fn f3_refuses_mode_7_anywhere_in_the_list() {
+fn f3_refuses_modes_7_and_8_anywhere_in_the_list() {
     for modes in [
         vec![Mode::Carousel],
         vec![Mode::Carousel, Mode::Gif],
         vec![Mode::Gif, Mode::Carousel],
+        vec![Mode::PresetRotation],
+        vec![Mode::PresetRotation, Mode::Gif],
+        vec![Mode::Gif, Mode::PresetRotation],
     ] {
         assert!(
             matches!(carousel_frame(5, &modes), Err(Error::InvalidArgument(_))),
@@ -795,6 +808,10 @@ fn de_maps_raw_values_to_modes() {
         (0x08, Some(Mode::Carousel)),
         // Internal 9, the byte E5 sends for mode 7.
         (0x0A, Some(Mode::Carousel)),
+        // Raw - 1 would make this number 8, which is 0x0B.
+        (0x09, None),
+        (0x0B, Some(Mode::PresetRotation)),
+        (0x0C, None),
     ];
     for (raw, expected) in cases {
         let status = parse_mode(&[0, raw, 1, 0]).unwrap();
@@ -807,7 +824,7 @@ fn de_maps_raw_values_to_modes() {
 fn de_raw_0x0b_is_representable() {
     let status = parse_mode(&[0, 0x0B, 1, 0]).unwrap();
     assert_eq!(status.raw_mode, 0x0B);
-    assert_eq!(status.mode(), None);
+    assert_eq!(status.mode(), Some(Mode::PresetRotation));
     assert!(status.on);
 }
 
@@ -816,7 +833,7 @@ fn de_accepts_every_raw_byte_without_inventing_a_mode() {
     for raw in 0..=255u8 {
         let status = parse_mode(&[0, raw, 0, 0]).unwrap();
         assert_eq!(status.raw_mode, raw);
-        let known = matches!(raw, 0x01..=0x08 | 0x0A);
+        let known = matches!(raw, 0x01..=0x08 | 0x0A | 0x0B);
         assert_eq!(status.mode().is_some(), known, "{raw:#x}");
     }
 }

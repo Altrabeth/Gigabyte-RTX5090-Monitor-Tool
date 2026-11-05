@@ -135,6 +135,10 @@ pub enum Mode {
     ChibiClock = 6,
     /// Built-in carousel. Not valid as an entry of a carousel.
     Carousel = 7,
+    /// Wire byte `0x0B`, which the real 5090 reported at rest. Upstream notes on
+    /// an RTX 5080 describe a rotation of the built-in screens plus stored user
+    /// content. Not valid as an entry of a carousel.
+    PresetRotation = 8,
 }
 
 impl Mode {
@@ -144,10 +148,12 @@ impl Mode {
     }
 
     /// The `E5` byte. Mode 7 is the GCC quirk: it maps to internal mode 9, so
-    /// the wire byte is `0x0A`, not `0x08`.
+    /// the wire byte is `0x0A`, not `0x08`. Number 8 is only this tool's label
+    /// for `0x0B`, so it is not `0x09`.
     pub const fn wire_byte(self) -> u8 {
         match self {
             Mode::Carousel => 0x0A,
+            Mode::PresetRotation => 0x0B,
             mode => mode.number() + 1,
         }
     }
@@ -156,7 +162,7 @@ impl Mode {
 impl TryFrom<u8> for Mode {
     type Error = Error;
 
-    /// Rejects anything above 7, so no other mode can reach the wire.
+    /// Rejects anything above 8, so no other mode can reach the wire.
     fn try_from(number: u8) -> Result<Self> {
         match number {
             0 => Ok(Mode::Faith1),
@@ -167,8 +173,9 @@ impl TryFrom<u8> for Mode {
             5 => Ok(Mode::Gif),
             6 => Ok(Mode::ChibiClock),
             7 => Ok(Mode::Carousel),
+            8 => Ok(Mode::PresetRotation),
             _ => Err(Error::InvalidArgument(format!(
-                "display mode must be 0 to 7, not {number}"
+                "display mode must be 0 to 8, not {number}"
             ))),
         }
     }
@@ -451,10 +458,11 @@ pub fn carousel_frame(interval: u8, modes: &[Mode]) -> Result<Frame> {
     }
     let mut tail = vec![interval];
     for mode in modes {
-        if *mode == Mode::Carousel {
-            return Err(Error::InvalidArgument(
-                "carousel modes must be 0 to 6, not 7".into(),
-            ));
+        if matches!(mode, Mode::Carousel | Mode::PresetRotation) {
+            return Err(Error::InvalidArgument(format!(
+                "carousel modes must be 0 to 6, not {}",
+                mode.number()
+            )));
         }
         tail.push(mode.wire_byte());
     }
@@ -731,7 +739,7 @@ pub fn parse_firmware(reply: &[u8]) -> Result<FirmwareVersion> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModeStatus {
     /// Byte 1 as the panel reported it. Kept because the panel can report
-    /// values with no known meaning, such as `0x0B`.
+    /// values with no known meaning, and `status` shows them as they are.
     pub raw_mode: u8,
     /// Whether the panel is on.
     pub on: bool,
@@ -742,10 +750,13 @@ impl ModeStatus {
     ///
     /// The references define this as raw - 1, with internal 9 meaning mode 7.
     /// So both `0x08` and the `0x0A` that `E5` sends read back as the carousel.
+    /// Raw - 1 stops at `0x08`: number 8 is `0x0B`, so `0x09` has no meaning.
     pub fn mode(&self) -> Option<Mode> {
         match self.raw_mode {
+            raw @ 0x01..=0x08 => Mode::try_from(raw - 1).ok(),
             0x0A => Some(Mode::Carousel),
-            raw => Mode::try_from(raw.checked_sub(1)?).ok(),
+            0x0B => Some(Mode::PresetRotation),
+            _ => None,
         }
     }
 }

@@ -124,6 +124,7 @@ fn mode_name(mode: Mode) -> &'static str {
         Mode::Gif => "GIF",
         Mode::ChibiClock => "chibi clock",
         Mode::Carousel => "carousel",
+        Mode::PresetRotation => "preset rotation",
     }
 }
 
@@ -214,8 +215,14 @@ mod tests {
 
     #[test]
     fn an_unknown_mode_shows_its_raw_value() {
-        assert_eq!(mode_line_of(0x0B), "unknown (raw 0x0B)");
         assert_eq!(mode_line_of(0x00), "unknown (raw 0x00)");
+        assert_eq!(mode_line_of(0x09), "unknown (raw 0x09)");
+        assert_eq!(mode_line_of(0x0C), "unknown (raw 0x0C)");
+    }
+
+    #[test]
+    fn the_raw_mode_the_panel_rests_in_is_named() {
+        assert_eq!(mode_line_of(0x0B), "8 preset rotation (raw 0x0B)");
     }
 
     #[test]

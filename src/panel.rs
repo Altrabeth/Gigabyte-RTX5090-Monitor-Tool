@@ -557,7 +557,11 @@ mod tests {
 
     #[test]
     fn a_refused_carousel_sends_nothing() {
-        for modes in [&[][..], &[Mode::Faith1, Mode::Carousel][..]] {
+        for modes in [
+            &[][..],
+            &[Mode::Faith1, Mode::Carousel][..],
+            &[Mode::Faith1, Mode::PresetRotation][..],
+        ] {
             let (mut panel, mock) = panel();
 
             let error = panel.set_carousel(5, modes).unwrap_err();

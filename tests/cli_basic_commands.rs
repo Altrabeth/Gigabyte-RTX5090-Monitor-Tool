@@ -99,6 +99,8 @@ fn mode_prints_the_wire_byte_of_each_mode() {
         ("6", "07"),
         // The GCC quirk: not 08.
         ("7", "0A"),
+        // Number 8 is a label: not 09.
+        ("8", "0B"),
     ];
     for (mode, wire) in cases {
         let first_row = format!("E5 CB 55 AC 38 {wire} 00 00 00 00 00 00 00 00 00 00");
@@ -109,9 +111,9 @@ fn mode_prints_the_wire_byte_of_each_mode() {
 }
 
 #[test]
-fn mode_refuses_anything_above_seven_before_printing() {
-    assert_refused(&["mode", "8"], "display mode must be 0 to 7, not 8");
-    assert_refused(&["mode", "255"], "display mode must be 0 to 7, not 255");
+fn mode_refuses_anything_above_eight_before_printing() {
+    assert_refused(&["mode", "9"], "display mode must be 0 to 8, not 9");
+    assert_refused(&["mode", "255"], "display mode must be 0 to 8, not 255");
     assert_refused(&["mode", "256"], "invalid value");
     assert_refused(&["mode", "gif"], "invalid value");
     assert_refused(&["mode"], "required");
@@ -172,6 +174,16 @@ fn carousel_interval_defaults_to_five() {
 }
 
 #[test]
+fn mode_help_offers_0_to_8() {
+    let output = dry_run(&["mode", "--help"]);
+
+    assert!(output.status.success(), "{output:?}");
+    let help = stdout(&output);
+    assert!(help.contains("<0-8>"), "{help}");
+    assert!(help.contains("8 preset rotation"), "{help}");
+}
+
+#[test]
 fn carousel_help_calls_it_an_interval_with_a_default_of_five() {
     let output = dry_run(&["carousel", "--help"]);
 
@@ -186,6 +198,8 @@ fn carousel_refuses_a_bad_list_before_printing() {
     assert_refused(&["carousel", "0,7"], "carousel modes must be 0 to 6, not 7");
     assert_refused(&["carousel", "7"], "carousel modes must be 0 to 6, not 7");
     assert_refused(&["carousel", "1,8"], "carousel modes must be 0 to 6, not 8");
+    assert_refused(&["carousel", "8"], "carousel modes must be 0 to 6, not 8");
+    assert_refused(&["carousel", "1,9"], "carousel modes must be 0 to 6, not 9");
     assert_refused(&["carousel"], "required");
     assert_refused(&["carousel", ""], "invalid value");
     assert_refused(&["carousel", "0,,1"], "invalid value");
