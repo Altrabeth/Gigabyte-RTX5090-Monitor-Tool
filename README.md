@@ -240,6 +240,10 @@ echo 'KERNEL=="i2c-[0-9]*", GROUP="i2c", MODE="0660"' | sudo tee /etc/udev/rules
 sudo udevadm control --reload && sudo udevadm trigger
 sudo usermod -aG i2c "$USER"   # re-login afterwards
 
+# create the bus lock file, which non-root users cannot
+sudo install -Dm644 dist/aorus-lcd.tmpfiles /etc/tmpfiles.d/aorus-lcd.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/aorus-lcd.conf
+
 # build
 cargo build --release
 ./target/release/aorus-lcd probe
@@ -248,9 +252,16 @@ cargo build --release
 Requires the proprietary NVIDIA driver (`nvidia` / `nvidia-open` + `nvidia-utils`).
 
 ### Daemon
+The service runs as an unprivileged dynamic user in group `i2c`, so it needs that group
+from Setup and the lock file from the tmpfiles entry. The `dist/` files match what Setup
+wrote, so installing them again changes nothing.
 ```bash
 sudo install -Dm755 target/release/aorus-lcd /usr/local/bin/aorus-lcd
 sudo install -Dm644 dist/aorus-lcd.service /etc/systemd/system/aorus-lcd.service
+sudo install -Dm644 dist/aorus-lcd.tmpfiles /etc/tmpfiles.d/aorus-lcd.conf
+sudo install -Dm644 dist/i2c-dev.conf /etc/modules-load.d/i2c-dev.conf
+sudo install -Dm644 dist/99-i2c.rules /etc/udev/rules.d/99-i2c.rules
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/aorus-lcd.conf
 sudo systemctl enable --now aorus-lcd
 ```
 

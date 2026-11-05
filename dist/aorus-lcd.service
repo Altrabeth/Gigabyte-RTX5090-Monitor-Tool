@@ -1,0 +1,64 @@
+[Unit]
+Description=AORUS LCD sensor feed for the RTX 5090 side panel
+Documentation=https://github.com/Altrabeth/Gigabyte-RTX5090-Monitor-Tool
+# Ordering only, and only so that the first attempt is likely to work: the
+# daemon waits by itself for i2c-dev, the adapter and NVML. nvidia-persistenced
+# is optional, and After= on a unit that does not exist is ignored. Requires=
+# would stop this service from starting on a system without it.
+After=nvidia-persistenced.service
+# RestartSec=10s uses this up in under a minute, then the unit stays failed.
+StartLimitIntervalSec=5min
+StartLimitBurst=5
+
+[Service]
+Type=exec
+# Add -v before "daemon" in a drop-in for more detail in the journal.
+ExecStart=/usr/local/bin/aorus-lcd daemon
+
+# The daemon retries everything that waiting can cure and exits 0 on SIGTERM, so
+# a failure here is a lock, permission or --bus problem. Most of those need an
+# admin, which is what the start limit is for, but not all: a device node is
+# root-only until udev applies the rule, so a restart has to be allowed.
+Restart=on-failure
+RestartSec=10s
+
+# A dynamic user rather than root: the daemon needs no capability, only what
+# group i2c gives it, and a dedicated static user would need one more file to
+# create it. NVIDIA device nodes are world-accessible by default. i2c has to
+# exist (README, Setup), or the service fails with status 216/GROUP.
+DynamicUser=true
+SupplementaryGroups=i2c
+
+# DynamicUser implies ProtectSystem=strict, which makes /run read-only. Without
+# this line the lock fails with EROFS even though its mode allows the write.
+#
+# As a non-root user this service needs the tmpfiles entry, since it cannot
+# create the lock. With "-" a missing file reaches the daemon, whose error names
+# the lock, instead of failing here with 226/NAMESPACE.
+ReadWritePaths=-/run/aorus-lcd.lock
+
+# The major numbers (i2c 89, nvidia 195) and not the names char-i2c and
+# char-nvidia*: systemd resolves a name through /proc/devices once, at start, so
+# a driver that loads later would stay blocked until the next restart. These two
+# majors are fixed. Both need rw: NVML opens its nodes read-write too.
+DevicePolicy=closed
+DeviceAllow=char-89 rw
+DeviceAllow=char-195 rw
+
+# Do not add PrivateDevices=, which hides the devices above, PrivateUsers=, which
+# loses group i2c, or ProcSubset=pid, which hides /proc/driver/nvidia.
+# MemoryDenyWriteExecute= and SystemCallFilter= are left out because NVML is a
+# closed library that loads into this process, and a change there would kill it.
+CapabilityBoundingSet=
+LockPersonality=true
+PrivateNetwork=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictNamespaces=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target

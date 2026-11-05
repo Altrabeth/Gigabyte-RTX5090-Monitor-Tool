@@ -1,0 +1,5 @@
+# Install as /etc/tmpfiles.d/aorus-lcd.conf. Needs the i2c group to exist.
+#
+# The bus lock that the daemon and the commands share. Non-root users cannot
+# create files in /run, and the lock opens read-write, so the group needs write.
+f /run/aorus-lcd.lock 0660 root i2c -
