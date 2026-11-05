@@ -158,11 +158,13 @@ aorus-lcd-rs/
 │   ├── rle.rs         # RLE encoder + GIF payload builder
 │   ├── sensors.rs     # NVML polling -> E3 values
 │   ├── session.rs     # the write gate: adapter, lock, device, EB 03 probe
+│   ├── config.rs      # the daemon's config file, merged with the CLI
 │   └── daemon.rs      # 1 Hz loop, signal handling, reconnect
 ├── assets/            # the embedded font and its licence
 ├── tests/             # byte-parity tests against vectors from aorus_lcd.py
 └── dist/
     ├── aorus-lcd.service
+    ├── aorus-lcd.toml       # commented example config
     ├── aorus-lcd.tmpfiles   # creates the bus lock file
     ├── i2c-dev.conf
     ├── 99-i2c.rules
@@ -194,7 +196,7 @@ aorus-lcd text "hello" [--color ff8800] [--bg 000000] [--size 32] [--no-effect] 
 aorus-lcd gif <file> [--frame-delay MS] [--no-overlay]
 aorus-lcd carousel 0,1,4 --interval 5
 aorus-lcd dashboard --widgets temp,clock,usage,fan,vram,power --interval 3
-aorus-lcd daemon [--config /etc/aorus-lcd.toml] [--frame-bytes 256|128] [--feed steady|adaptive]
+aorus-lcd daemon [--config /etc/aorus-lcd.toml] [--widgets LIST] [--interval SECS] [--frame-bytes 256|128] [--feed steady|adaptive]
 aorus-lcd save
 global: --bus N  --dry-run  -v
 ```
@@ -278,6 +280,15 @@ sudo install -Dm644 dist/i2c-dev.conf /etc/modules-load.d/i2c-dev.conf
 sudo install -Dm644 dist/99-i2c.rules /etc/udev/rules.d/99-i2c.rules
 sudo systemd-tmpfiles --create /etc/tmpfiles.d/aorus-lcd.conf
 sudo systemctl enable --now aorus-lcd
+```
+
+The daemon reads `/etc/aorus-lcd.toml` once at start, if it exists; `--config PATH` reads
+another file instead. Options on the command line beat the file, and the file beats the
+defaults. An unknown key, a bad value or a file that exists but cannot be read stops the
+daemon before it touches the bus. The example changes nothing until a setting in it is
+uncommented:
+```bash
+sudo install -Dm644 dist/aorus-lcd.toml /etc/aorus-lcd.toml
 ```
 
 ---
