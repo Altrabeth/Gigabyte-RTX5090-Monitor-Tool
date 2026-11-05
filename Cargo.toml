@@ -1,0 +1,28 @@
+[package]
+name = "aorus-lcd-rs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Drives the LCD Edge View panel of the Gigabyte AORUS RTX 5090 Master on Linux"
+repository = "https://github.com/Altrabeth/Gigabyte-RTX5090-Monitor-Tool"
+
+[lib]
+name = "aorus_lcd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aorus-lcd"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+
+[profile.release]
+# "s" rather than "z": image resizing and RLE encoding are CPU-bound and stay
+# noticeably faster at "s" for almost the same size.
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
