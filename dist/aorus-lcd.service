@@ -16,7 +16,7 @@ Type=exec
 ExecStart=/usr/local/bin/aorus-lcd daemon
 
 # The daemon retries everything that waiting can cure and exits 0 on SIGTERM, so
-# a failure here is a lock, permission or --bus problem. Most of those need an
+# a failure here is a lock, permission, config or --bus problem. Most of those need an
 # admin, which is what the start limit is for, but not all: a device node is
 # root-only until udev applies the rule, so a restart has to be allowed.
 Restart=on-failure

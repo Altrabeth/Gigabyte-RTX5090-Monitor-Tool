@@ -1,7 +1,10 @@
 //! `aorus-lcd daemon`: keeps the panel's sensor feed running.
 
+use std::path::PathBuf;
+
+use aorus_lcd::config::{self, Resolved, Settings};
 use aorus_lcd::daemon::{self, DaemonConfig, FeedStrategy};
-use aorus_lcd::protocol::FeedFrameLen;
+use aorus_lcd::protocol::{parse_widgets, Elements, FeedFrameLen};
 use aorus_lcd::{Error, Result};
 
 /// How long `--dry-run` runs, since nothing else ends it unattended.
@@ -10,6 +13,25 @@ const DRY_RUN_TICKS: u64 = 3;
 /// Arguments of `aorus-lcd daemon`.
 #[derive(Debug, clap::Args)]
 pub struct Args {
+    /// Config file. Without this, /etc/aorus-lcd.toml is read if it exists
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Widgets to keep on the panel, comma-separated: temp, clock, usage, fan,
+    /// ramclock, vram, fps, power. This writes E1 when the panel differs; without
+    /// widgets the panel keeps what it has
+    #[arg(long, value_name = "LIST", value_parser = parse_widgets)]
+    pub widgets: Option<Elements>,
+
+    /// Seconds before the panel rotates to the next widget. Needs widgets, here or
+    /// in the config, because it goes out with E1
+    #[arg(
+        long,
+        value_name = "SECS",
+        value_parser = clap::value_parser!(u8).range(1..),
+    )]
+    pub interval: Option<u8>,
+
     /// Bytes per E3 frame: 256, the known-good spec, or 128, untested on a 5090
     #[arg(long, value_name = "256|128", value_parser = parse_frame_bytes)]
     pub frame_bytes: Option<FeedFrameLen>,
@@ -25,21 +47,35 @@ pub struct Args {
 }
 
 /// Runs until SIGTERM or SIGINT, which is `Ok`. An error is what `main` should
-/// exit non-zero on, so that systemd shows the failure.
+/// exit non-zero on, so that systemd shows the failure. The config is settled
+/// first, because a bad one has to stop this before anything connects.
 pub fn run(args: Args, globals: &crate::Globals) -> Result<()> {
-    let options = globals.options();
-    daemon::run(config_from(args, options.dry_run), &options)
+    let file = config::load(args.config.as_deref(), config::DEFAULT_PATH.as_ref())?;
+    let Resolved { daemon, bus } = config::resolve(args.settings(globals.bus), &file)?;
+
+    let mut options = globals.options();
+    options.bus = bus;
+    daemon::run(args.limited(daemon, options.dry_run), &options)
 }
 
-/// An option left out keeps the [`DaemonConfig`] default, which stays the one
-/// place that defines it.
-fn config_from(args: Args, dry_run: bool) -> DaemonConfig {
-    let defaults = DaemonConfig::default();
-    DaemonConfig {
-        feed: args.frame_bytes.unwrap_or(defaults.feed),
-        strategy: args.feed.unwrap_or(defaults.strategy),
-        max_ticks: args.max_ticks.or(dry_run.then_some(DRY_RUN_TICKS)),
-        ..defaults
+impl Args {
+    /// What the command line sets. `bus` is the global `--bus`.
+    fn settings(&self, bus: Option<u32>) -> Settings {
+        Settings {
+            widgets: self.widgets,
+            interval: self.interval,
+            feed: self.feed,
+            frame_bytes: self.frame_bytes,
+            bus,
+        }
+    }
+
+    /// `config` with the tick limit, which no config file can set.
+    fn limited(&self, config: DaemonConfig, dry_run: bool) -> DaemonConfig {
+        DaemonConfig {
+            max_ticks: self.max_ticks.or(dry_run.then_some(DRY_RUN_TICKS)),
+            ..config
+        }
     }
 }
 
@@ -52,6 +88,8 @@ fn parse_frame_bytes(value: &str) -> Result<FeedFrameLen> {
 
 #[cfg(test)]
 mod tests {
+    use aorus_lcd::config::FileConfig;
+    use aorus_lcd::protocol::Element;
     use clap::{CommandFactory, Parser};
 
     use super::*;
@@ -64,7 +102,9 @@ mod tests {
 
     fn config_parsed_from(arguments: &[&str]) -> DaemonConfig {
         let line = ["daemon"].iter().chain(arguments);
-        config_from(Harness::try_parse_from(line).unwrap().args, false)
+        let args = Harness::try_parse_from(line).unwrap().args;
+        let resolved = config::resolve(args.settings(None), &FileConfig::default()).unwrap();
+        args.limited(resolved.daemon, false)
     }
 
     #[test]
@@ -81,6 +121,34 @@ mod tests {
         let config = config_parsed_from(&["--frame-bytes", "256", "--feed", "steady"]);
         assert_eq!(config.feed, FeedFrameLen::Full);
         assert_eq!(config.strategy, FeedStrategy::Steady);
+    }
+
+    #[test]
+    fn the_widgets_and_interval_reach_the_config() {
+        let config = config_parsed_from(&["--widgets", "fps,temp", "--interval", "9"]);
+
+        let expected = Elements::NONE.with(Element::Fps).with(Element::GpuTemp);
+        assert_eq!(config.elements, Some(expected));
+        assert_eq!(config.interval_s, 9);
+    }
+
+    #[test]
+    fn bad_widgets_and_intervals_do_not_parse() {
+        for value in ["", "nope", "temp,temp"] {
+            let line = ["daemon", "--widgets", value];
+            assert!(Harness::try_parse_from(line).is_err(), "{value}");
+        }
+        for value in ["0", "256", "soon", ""] {
+            let line = ["daemon", "--interval", value];
+            assert!(Harness::try_parse_from(line).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn the_global_bus_counts_as_the_command_line() {
+        let args = Harness::try_parse_from(["daemon"]).unwrap().args;
+
+        assert_eq!(args.settings(Some(4)).bus, Some(4));
     }
 
     #[test]

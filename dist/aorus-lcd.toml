@@ -1,0 +1,34 @@
+# Config for `aorus-lcd daemon`. Install it as /etc/aorus-lcd.toml, or pass
+# --config PATH. It is read once at start, and options on the command line beat
+# it. Every setting below is commented out, so this file changes nothing as it
+# stands. An unknown key or a bad value stops the daemon before it touches the bus.
+
+# Widgets to show, as one comma-separated string: temp, clock, usage, fan,
+# ramclock, vram, fps, power.
+#
+# Leave this out to keep whatever the panel already has, and to avoid writing
+# E1, the frame that sets the widgets. E1 is the prime suspect in dark-panel
+# incidents. With widgets set, the daemon sends E1 whenever the panel differs
+# from widgets and interval, so a panel with another interval is changed too.
+#widgets = "temp,clock,usage,fan,vram,power"
+
+# Seconds before the panel rotates to the next widget, 1 to 255. Without it,
+# widgets go out with an interval of 3.
+#
+# This needs widgets, here or in --widgets: the interval goes out with E1, and
+# E1 is only sent when widgets are named. A config with only this is an error.
+#interval = 3
+
+# How often the sensor frame goes out. "steady" sends one every second. "adaptive"
+# does too under 50% GPU usage, and from there up sends a 5-second summary, twice,
+# every 6 seconds. That means fewer writes while the GPU is busy, for values that
+# update less often.
+#feed = "steady"
+
+# Bytes per sensor frame, 256 or 128. 256 is the known-good spec. 128 takes less
+# time on the bus, but it is untested on a 5090, so the panel may ignore it.
+#frame_bytes = 256
+
+# The I2C bus, instead of autodetecting. It must still be an NVIDIA adapter: any
+# other bus is refused, and that stops the daemon. --bus beats this.
+#bus = 3
