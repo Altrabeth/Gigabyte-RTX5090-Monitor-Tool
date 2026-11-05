@@ -17,6 +17,8 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 rustix = { version = "1", features = ["fs"] }
+log = "0.4"
+nvml-wrapper = { version = "0.13", default-features = false }
 thiserror = "2"
 
 [dev-dependencies]
