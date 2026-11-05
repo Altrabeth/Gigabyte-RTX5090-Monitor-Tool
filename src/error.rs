@@ -53,8 +53,9 @@ pub enum Error {
     /// The bus lock file could not be created or opened. There is deliberately
     /// no fallback path: a second path would break mutual exclusion.
     #[error(
-        "cannot open bus lock {}: check the aorus-lcd tmpfiles.d entry and membership of the i2c group",
-        path.display()
+        "cannot open bus lock {}: check the aorus-lcd tmpfiles.d entry and membership of the i2c group, or until it is installed set {} to a writable path shared by every aorus-lcd process",
+        path.display(),
+        crate::bus::lock::LOCK_PATH_ENV
     )]
     Lock {
         /// The lock file.

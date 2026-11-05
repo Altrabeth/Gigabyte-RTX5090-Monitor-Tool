@@ -368,6 +368,7 @@ mod tests {
 
         assert!(error.to_string().contains("tmpfiles.d"), "{error}");
         assert!(error.to_string().contains("i2c group"), "{error}");
+        assert!(error.to_string().contains("AORUS_LCD_LOCK"), "{error}");
         match error {
             Error::Lock {
                 path: reported,

@@ -148,6 +148,7 @@ aorus-lcd-rs/
 │   ├── image.rs       # resize to 320x170, RGB565 conversion, text render
 │   ├── rle.rs         # RLE encoder + GIF payload builder
 │   ├── sensors.rs     # NVML polling -> E3 values
+│   ├── session.rs     # the write gate: adapter, lock, device, EB 03 probe
 │   └── daemon.rs      # 1 Hz loop, signal handling, reconnect
 ├── tests/             # byte-parity tests against vectors from aorus_lcd.py
 └── dist/
@@ -175,7 +176,7 @@ Suggested crates: `clap`, `anyhow`/`thiserror`, `i2cdev` or `nix` (ioctls),
 
 ### CLI sketch
 ```
-aorus-lcd probe
+aorus-lcd probe [--wait SECS]
 aorus-lcd on | off
 aorus-lcd mode <0-7>
 aorus-lcd image <file> [--save]
