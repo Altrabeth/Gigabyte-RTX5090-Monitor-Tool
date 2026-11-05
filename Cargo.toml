@@ -16,7 +16,11 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+rustix = { version = "1", features = ["fs"] }
 thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 # "s" rather than "z": image resizing and RLE encoding are CPU-bound and stay
