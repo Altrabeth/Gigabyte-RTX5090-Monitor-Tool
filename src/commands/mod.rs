@@ -13,4 +13,5 @@
 //! Registering it takes one `pub mod <name>;` here, and one variant and one
 //! match arm in `main.rs`.
 
+pub mod dashboard;
 pub mod probe;
