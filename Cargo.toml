@@ -19,6 +19,9 @@ clap = { version = "4", features = ["derive"] }
 rustix = { version = "1", features = ["fs"] }
 log = "0.4"
 nvml-wrapper = { version = "0.13", default-features = false }
+# Only the formats we accept, to keep the binary small: the defaults add rayon
+# and codecs such as AVIF, EXR and TIFF.
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 thiserror = "2"
 
 [dev-dependencies]
