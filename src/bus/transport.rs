@@ -310,6 +310,15 @@ impl<W: Write> DryRun<W> {
         Self { out, verbose }
     }
 
+    /// Prints a line of explanation among the frames.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::I2c`] if printing fails, as for a frame.
+    pub fn note(&mut self, text: &str) -> Result<()> {
+        writeln!(self.out, "{text}").map_err(print_failed)
+    }
+
     fn print_frame(&mut self, frame: &[u8]) -> std::io::Result<()> {
         let len = frame.len();
         // Payload chunks carry no magic, which tells them apart from commands.
@@ -333,14 +342,18 @@ impl<W: Write> Transport for DryRun<W> {
         // Refuses what the real link refuses, so a preview cannot pass a frame
         // that would fail for real.
         message_len(frame.len())?;
-        self.print_frame(frame).map_err(|source| Error::I2c {
-            context: "printing the dry-run dump".into(),
-            source,
-        })
+        self.print_frame(frame).map_err(print_failed)
     }
 
     fn read(&mut self, _buf: &mut [u8]) -> Result<()> {
         Err(Error::ReadbackUnavailable)
+    }
+}
+
+fn print_failed(source: std::io::Error) -> Error {
+    Error::I2c {
+        context: "printing the dry-run dump".into(),
+        source,
     }
 }
 

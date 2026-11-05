@@ -5,10 +5,10 @@
 //! [`run_with`] is a state machine over injected parts, which is how every
 //! failure below is tested on a fake clock:
 //!
-//! - **Connect:** through the [write gate](crate::session), then `E1` exactly
-//!   once, then `E3` until the bus fails. `EB 03`, one `E1` per connection and
-//!   `E3` are all this module sends. `E1` is the prime suspect in dark-panel
-//!   incidents (`RECOVERY.md`), and `AA` writes NVRAM.
+//! - **Connect:** through the [write gate](crate::session), then `DF`, then at
+//!   most one `E1`, then `E3` until the bus fails. `EB 03`, `DF`, that `E1` and
+//!   `E3` are all this module sends: `AA` writes NVRAM. See below for when `E1`
+//!   goes out.
 //! - **Ticks** run on deadlines, each the previous one plus [`TICK`], so the
 //!   time spent working does not add up. A missed deadline is dropped rather
 //!   than made up for: late frames carry stale values, and a burst of them is
@@ -21,11 +21,28 @@
 //!   reads as a failure, where a repeated value would look live.
 //! - **Shutdown** sends nothing: the panel is left exactly as it is.
 //!
+//! # When `E1` goes out
+//!
+//! `E1` is the prime suspect in dark-panel incidents (`RECOVERY.md`), and the
+//! panel keeps its widget config across boots: `DF` read all eight widgets every
+//! 4 s on a panel this tool had never written to. So each connection reads `DF`
+//! and sends `E1` only for a reason:
+//!
+//! - If the config names widgets, when the panel's widgets or interval differ.
+//! - If it names none, when the panel has no widget enabled, and then the
+//!   README's defaults. With any widget enabled, nothing about the panel's
+//!   selection or interval is touched.
+//!
+//! A failed `DF` says nothing about the panel, so it never leads to a blind `E1`.
+//! It fails the connection like any other session step, and takes the normal
+//! backoff. A dry-run has no read-backs: it prints the `DF` query and the `E1` a
+//! real run might send, and says that a real run decides.
+//!
 //! # Why a failed write waits for the next tick
 //!
 //! The GPU's I2C engine sometimes rejects a valid transfer on a healthy bus, and
-//! reconnecting over each of those would send an `E1` every time, so writes need
-//! a retry. [`Retrying`](crate::bus::transport::Retrying) does not fit a tick: it
+//! reconnecting over each of those would mean a `DF` and maybe an `E1` every
+//! time, so writes need a retry. [`Retrying`](crate::bus::transport::Retrying) does not fit a tick: it
 //! sleeps 800 ms across five attempts with the lock held, which keeps an upload
 //! off the bus for no reason, and with slow failing transfers on top it runs past
 //! the next deadline.
@@ -55,7 +72,9 @@ use crate::bus::discovery::{discover, SYSFS_ROOT};
 use crate::bus::transport::{DryRun, Transport};
 use crate::error::{Error, Result};
 use crate::panel::{Panel, Sleep, ThreadSleep};
-use crate::protocol::{parse_widgets, Elements, FeedFrameLen, SensorSample, DEFAULT_WIDGETS};
+use crate::protocol::{
+    parse_widgets, DisplayStatus, Elements, FeedFrameLen, SensorSample, DEFAULT_WIDGETS,
+};
 use crate::sensors::{NvmlSensors, SensorSource};
 use crate::session::{self, Options, Session, Unlocked};
 
@@ -80,9 +99,11 @@ pub const WRITE_ATTEMPTS: u32 = 3;
 /// What the daemon shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DaemonConfig {
-    /// The widgets `E1` selects.
-    pub elements: Elements,
-    /// The widget rotation interval `E1` sets, in seconds.
+    /// The widgets the config names. `None` leaves the panel's own selection
+    /// alone unless it has no widgets: see the [module docs](self).
+    pub elements: Option<Elements>,
+    /// The widget rotation interval `E1` sets, in seconds. With no widgets named,
+    /// this only applies when a panel with no widgets gets the defaults.
     pub interval_s: u8,
     /// The length of each `E3`.
     pub feed: FeedFrameLen,
@@ -91,14 +112,38 @@ pub struct DaemonConfig {
 }
 
 impl Default for DaemonConfig {
-    /// The README's six default widgets.
+    /// Names no widgets, so the panel keeps what it has.
     fn default() -> Self {
         Self {
-            elements: parse_widgets(DEFAULT_WIDGETS).expect("the default widgets are valid"),
+            elements: None,
             interval_s: 3,
             feed: FeedFrameLen::Full,
             max_ticks: None,
         }
+    }
+}
+
+impl DaemonConfig {
+    /// What `E1` carries if it goes out: the named widgets, or else the README's
+    /// six defaults.
+    pub fn dashboard(&self) -> DisplayStatus {
+        DisplayStatus {
+            elements: self.elements.unwrap_or_else(|| {
+                parse_widgets(DEFAULT_WIDGETS).expect("the default widgets are valid")
+            }),
+            interval_s: self.interval_s,
+        }
+    }
+
+    /// What `E1` should carry for a panel showing `panel`, or `None` if it should
+    /// not be sent. See the [module docs](self).
+    fn update_for(&self, panel: DisplayStatus) -> Option<DisplayStatus> {
+        let wanted = self.dashboard();
+        let needed = match self.elements {
+            Some(_) => panel != wanted,
+            None => panel.elements == Elements::NONE,
+        };
+        needed.then_some(wanted)
     }
 }
 
@@ -138,6 +183,10 @@ impl<S: Sleep> Sleep for UntilStopped<S> {
         }
     }
 }
+
+/// What a dry-run prints between the `DF` query and `E1`.
+const WOULD_DECIDE: &str =
+    "dry-run: read-backs are unavailable, so E1 is shown; a real run decides from DF";
 
 /// What [`run_with`] reaches the outside world through. [`run`] fills this in
 /// with the real ones, and tests with harmless ones.
@@ -245,7 +294,7 @@ where
     .run()
 }
 
-/// The open link to the panel, past `E1`.
+/// The open link to the panel, past the point where `E1` can go out.
 enum Link<T, W> {
     Live(Unlocked<T>),
     DryRun(DryRun<W>),
@@ -451,30 +500,56 @@ where
         }
     }
 
-    /// One pass through the gate, then the one `E1` of this connection, sent
-    /// under the gate's lock so that an upload cannot slip in between.
+    /// One pass through the gate, then `DF` and any `E1` of this connection, under
+    /// the gate's lock so that an upload cannot slip in between. A failed `DF`
+    /// returns from here like any other error, so the caller backs off.
     fn connect_once(&mut self) -> Result<Option<Connection<T, W>>> {
         let session = (self.connect)()?;
         // The gate can take seconds, and a shutdown sends nothing.
         if self.stopped() {
             return Ok(None);
         }
-        let DaemonConfig {
-            elements,
-            interval_s,
-            ..
-        } = self.config;
         match session {
             Session::Live(mut verified) => {
-                Panel::new(&mut verified).set_dashboard(elements, interval_s)?;
+                if !self.configure(&mut verified)? {
+                    return Ok(None);
+                }
                 let pci_bus = verified.adapter().pci_bus();
                 Ok(Some((Link::Live(verified.unlock()), pci_bus)))
             }
             Session::DryRun(mut dry_run) => {
-                Panel::new(&mut dry_run).set_dashboard(elements, interval_s)?;
+                self.preview(&mut dry_run)?;
                 Ok(Some((Link::DryRun(dry_run), None)))
             }
         }
+    }
+
+    /// Reads `DF` and sends `E1` if the panel needs it. `false` if asked to stop.
+    fn configure(&self, transport: &mut impl Transport) -> Result<bool> {
+        let mut panel = Panel::new(transport);
+        let shown = panel.display()?;
+        let update = self.config.update_for(shown);
+        log_decision(shown, update);
+        // The read took time, and a shutdown sends nothing.
+        if self.stopped() {
+            return Ok(false);
+        }
+        if let Some(wanted) = update {
+            panel.set_dashboard(wanted.elements, wanted.interval_s)?;
+        }
+        Ok(true)
+    }
+
+    /// Shows what [`Self::configure`] might send. There is no reply to decide
+    /// from, but a failure to print still ends the run.
+    fn preview(&self, dry_run: &mut DryRun<W>) -> Result<()> {
+        match Panel::new(&mut *dry_run).display() {
+            Err(Error::ReadbackUnavailable) => {}
+            other => drop(other?),
+        }
+        dry_run.note(WOULD_DECIDE)?;
+        let wanted = self.config.dashboard();
+        Panel::new(dry_run).set_dashboard(wanted.elements, wanted.interval_s)
     }
 
     /// Ticks until the session ends. The first deadline is now: the panel has
@@ -539,6 +614,19 @@ where
     }
 }
 
+/// Logs what the panel has and what happens to it.
+fn log_decision(shown: DisplayStatus, update: Option<DisplayStatus>) {
+    let (mask, interval) = (shown.elements.bits(), shown.interval_s);
+    match update {
+        Some(wanted) => log::info!(
+            "panel has widgets 0x{mask:02X} every {interval} s: sending E1 with 0x{:02X} every {} s",
+            wanted.elements.bits(),
+            wanted.interval_s
+        ),
+        None => log::info!("panel has widgets 0x{mask:02X} every {interval} s: no E1 needed"),
+    }
+}
+
 /// The deadline after `previous`. If that one has passed already it is dropped,
 /// not made up for: see the [module docs](self).
 fn next_deadline(previous: Instant, now: Instant) -> Instant {
@@ -567,13 +655,70 @@ mod tests {
     use crate::panel::RecordingSleep;
 
     #[test]
-    fn the_default_is_the_six_readme_widgets() {
+    fn the_default_names_no_widgets_and_falls_back_to_the_six_readme_ones() {
         let config = DaemonConfig::default();
 
-        assert_eq!(config.elements.bits(), 0xAF);
-        assert_eq!(config.interval_s, 3);
+        assert_eq!(config.elements, None);
+        assert_eq!(config.dashboard().elements.bits(), 0xAF);
+        assert_eq!(config.dashboard().interval_s, 3);
         assert_eq!(config.feed, FeedFrameLen::Full);
         assert_eq!(config.max_ticks, None);
+    }
+
+    fn shown(mask: u8, interval_s: u8) -> DisplayStatus {
+        DisplayStatus {
+            elements: Elements::from_bits(mask),
+            interval_s,
+        }
+    }
+
+    fn naming(mask: u8) -> DaemonConfig {
+        DaemonConfig {
+            elements: Some(Elements::from_bits(mask)),
+            ..DaemonConfig::default()
+        }
+    }
+
+    #[test]
+    fn named_widgets_must_match_in_mask_and_interval() {
+        let config = naming(0x05);
+
+        assert_eq!(config.update_for(shown(0x05, 3)), None);
+        assert_eq!(config.update_for(shown(0x07, 3)), Some(shown(0x05, 3)));
+        assert_eq!(config.update_for(shown(0x05, 4)), Some(shown(0x05, 3)));
+        assert_eq!(config.update_for(shown(0x00, 0)), Some(shown(0x05, 3)));
+    }
+
+    #[test]
+    fn naming_an_empty_list_is_still_a_named_config() {
+        let config = naming(0x00);
+
+        assert_eq!(config.update_for(shown(0x00, 3)), None);
+        assert_eq!(config.update_for(shown(0xFF, 4)), Some(shown(0x00, 3)));
+    }
+
+    #[test]
+    fn without_named_widgets_any_enabled_widget_is_left_alone() {
+        let config = DaemonConfig::default();
+
+        for panel in [
+            shown(0xFF, 4),
+            shown(0x01, 3),
+            shown(0x80, 0),
+            shown(0xAF, 200),
+        ] {
+            assert_eq!(config.update_for(panel), None, "{panel:?}");
+        }
+    }
+
+    #[test]
+    fn without_named_widgets_a_panel_with_none_gets_the_defaults() {
+        let config = DaemonConfig::default();
+
+        for interval_s in [0, 3, 200] {
+            let update = config.update_for(shown(0x00, interval_s));
+            assert_eq!(update, Some(shown(0xAF, 3)));
+        }
     }
 
     #[test]
