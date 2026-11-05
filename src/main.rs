@@ -58,8 +58,22 @@ impl Globals {
 enum Command {
     /// Choose the sensor widgets the panel shows
     Dashboard(commands::dashboard::Args),
+    /// Cycle through display modes
+    Carousel(commands::carousel::Args),
+    /// Select the display mode
+    Mode(commands::mode::Args),
+    /// Turn the panel off
+    Off(commands::off::Args),
+    /// Turn the panel on
+    On(commands::on::Args),
     /// Check that the panel controller answers, and show its status
     Probe(commands::probe::Args),
+    /// Save the panel configuration: this writes to the panel's NVRAM
+    ///
+    /// In text mode the same frame also starts the text rainbow effect.
+    Save(commands::save::Args),
+    /// Show firmware, mode, on-state, dashboard and carousel banks
+    Status(commands::status::Args),
 }
 
 /// Runs the chosen subcommand. An arm looks like
@@ -67,7 +81,13 @@ enum Command {
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Dashboard(args) => commands::dashboard::run(args, &cli.globals),
+        Command::Carousel(args) => commands::carousel::run(args, &cli.globals),
+        Command::Mode(args) => commands::mode::run(args, &cli.globals),
+        Command::Off(args) => commands::off::run(args, &cli.globals),
+        Command::On(args) => commands::on::run(args, &cli.globals),
         Command::Probe(args) => commands::probe::run(args, &cli.globals),
+        Command::Save(args) => commands::save::run(args, &cli.globals),
+        Command::Status(args) => commands::status::run(args, &cli.globals),
     }
 }
 
