@@ -13,5 +13,11 @@
 //! Registering it takes one `pub mod <name>;` here, and one variant and one
 //! match arm in `main.rs`.
 
+pub mod carousel;
 pub mod dashboard;
+pub mod mode;
+pub mod off;
+pub mod on;
 pub mod probe;
+pub mod save;
+pub mod status;
