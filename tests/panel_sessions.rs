@@ -2,18 +2,21 @@
 //! here opens a device: the gate only ever receives a [`Mock`], and the sysfs
 //! tree and lock file are temporary.
 
+use std::cell::Cell;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::time::Duration;
 
 use aorus_lcd::bus::lock::BusLock;
 use aorus_lcd::bus::transport::testing::{i2c_error, Mock};
 use aorus_lcd::bus::transport::{DryRun, Retrying, Transport};
-use aorus_lcd::panel::{Panel, RecordingSleep};
+use aorus_lcd::panel::{NoSleep, Panel, RecordingSleep, Sleep, UploadOptions};
 use aorus_lcd::protocol::{
-    carousel_frame, display_frame, firmware_query_frame, loop_query_frame, mode_frame, power_frame,
-    probe_frame, sensor_frame, Elements, FeedFrameLen, Mode, SensorSample, LOOP_BANK_FIRST,
-    PROBE_READ_LEN,
+    build_upload, carousel_frame, display_frame, firmware_query_frame, loop_query_frame,
+    mode_frame, power_frame, probe_frame, sensor_frame, Elements, FeedFrameLen, Framebuffer, Mode,
+    SensorSample, UploadParams, LOOP_BANK_FIRST, PROBE_READ_LEN,
 };
 use aorus_lcd::session::{connect_with, Environment, Options, Session, Unlocked, Verified};
 use aorus_lcd::{Error, Result};
@@ -29,6 +32,18 @@ const SAMPLE: SensorSample = SensorSample {
     fps: 0,
     tgp_watts: 450,
 };
+
+/// Two chunks.
+const PAYLOAD: [u8; 300] = [0x44; 300];
+
+/// The frames of an upload of [`PAYLOAD`], without the `SetMode`.
+fn upload_writes(params: &UploadParams) -> Vec<Vec<u8>> {
+    build_upload(&PAYLOAD, params)
+        .unwrap()
+        .iter()
+        .map(|frame| frame.data.to_vec())
+        .collect()
+}
 
 /// A temporary sysfs tree and lock path, and a scripted device behind them.
 struct Rig {
@@ -234,6 +249,122 @@ fn retrying_comes_from_wrapping_the_link() {
     // The probe's read, then the failed read and its retry.
     assert_eq!(rig.mock.read_attempts(), 3);
     assert_eq!(rig.writes_after_probe(), [firmware_query_frame().to_vec()]);
+}
+
+/// Asserts on every pause that the bus lock is taken, so a passing test shows
+/// that it was held across all of them. Clones count together.
+#[derive(Clone)]
+struct LockHeldCheck {
+    path: PathBuf,
+    checks: Rc<Cell<usize>>,
+}
+
+impl Sleep for LockHeldCheck {
+    fn sleep(&mut self, _duration: Duration) {
+        let attempt = BusLock::try_acquire(&self.path);
+        assert!(
+            matches!(attempt, Err(Error::LockBusy { .. })),
+            "{attempt:?}"
+        );
+        self.checks.set(self.checks.get() + 1);
+    }
+}
+
+#[test]
+fn a_verified_holds_the_lock_across_every_pause_of_an_upload() {
+    let cases = [
+        (UploadParams::still(Framebuffer::Static), 5),
+        (UploadParams::still(Framebuffer::Text), 5),
+        // The settle comes on top.
+        (UploadParams::gif(2, 50), 6),
+    ];
+    for (params, pauses) in cases {
+        let rig = Rig::new();
+        let verified = rig.verified();
+        let mut clock = LockHeldCheck {
+            path: rig.lock_path(),
+            checks: Rc::default(),
+        };
+        let options = UploadOptions::default();
+
+        Panel::new(verified)
+            .upload(&PAYLOAD, &params, options, &mut clock, |_| {})
+            .unwrap();
+
+        assert_eq!(clock.checks.get(), pauses);
+        assert!(rig.lock_is_free());
+    }
+}
+
+#[test]
+fn the_lock_is_also_held_across_the_pauses_of_a_retry() {
+    let rig = Rig::new();
+    let verified = rig.verified();
+    let mut clock = LockHeldCheck {
+        path: rig.lock_path(),
+        checks: Rc::default(),
+    };
+    // The probe was attempt 0, so these are Begin and its first retry.
+    rig.mock.fail_write(1, i2c_error());
+    rig.mock.fail_write(2, i2c_error());
+    let options = UploadOptions::default();
+    let params = UploadParams::still(Framebuffer::Static);
+
+    Panel::new(Retrying::with_sleep(verified, clock.clone()))
+        .upload(&PAYLOAD, &params, options, &mut clock, |_| {})
+        .unwrap();
+
+    // Two retries, and the five pauses of the upload.
+    assert_eq!(clock.checks.get(), 7);
+    assert_eq!(rig.writes_after_probe().len(), 6);
+}
+
+#[test]
+fn a_tick_cannot_get_in_while_an_upload_pauses() {
+    /// Runs the daemon's tick on every pause of the upload.
+    struct TickingClock {
+        daemon: Unlocked<Mock>,
+    }
+
+    impl Sleep for TickingClock {
+        fn sleep(&mut self, _duration: Duration) {
+            tick(&mut self.daemon, FeedFrameLen::Full).unwrap();
+        }
+    }
+
+    let rig = Rig::new();
+    let daemon = rig.verified().unlock();
+    let verified = rig.verified();
+    let mut clock = TickingClock { daemon };
+    let params = UploadParams::still(Framebuffer::Static);
+    let options = UploadOptions::default();
+
+    Panel::new(verified)
+        .upload(&PAYLOAD, &params, options, &mut clock, |_| {})
+        .unwrap();
+
+    // Only the two probes and the upload: no tick got through.
+    let mut expected = vec![probe_frame().to_vec(); 2];
+    expected.extend(upload_writes(&params));
+    expected.push(mode_frame(Mode::Image).to_vec());
+    assert_eq!(rig.mock.writes(), expected);
+}
+
+#[test]
+fn dry_run_prints_an_upload_without_waiting() {
+    let params = UploadParams::still(Framebuffer::Static);
+    let mut expected = vec![probe_frame().to_vec()];
+    expected.extend(upload_writes(&params));
+    expected.push(mode_frame(Mode::Image).to_vec());
+    let expected: Vec<&[u8]> = expected.iter().map(Vec::as_slice).collect();
+
+    let (result, text) = in_dry_run(|panel| {
+        let options = UploadOptions::default();
+        panel.upload(&PAYLOAD, &params, options, &mut NoSleep, |_| {})
+    });
+
+    result.unwrap();
+    assert_eq!(text, dump_of(&expected));
 }
 
 #[test]
