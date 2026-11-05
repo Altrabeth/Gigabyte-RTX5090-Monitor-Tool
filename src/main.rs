@@ -80,6 +80,11 @@ enum Command {
     Save(commands::save::Args),
     /// Show firmware, mode, on-state, dashboard and carousel banks
     Status(commands::status::Args),
+    /// Show text
+    ///
+    /// By default this also starts the rainbow effect, whose frame saves the panel
+    /// configuration to NVRAM. Use --no-effect to avoid that write.
+    Text(commands::text::Args),
 }
 
 /// Runs the chosen subcommand. An arm looks like
@@ -97,6 +102,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Probe(args) => commands::probe::run(args, &cli.globals),
         Command::Save(args) => commands::save::run(args, &cli.globals),
         Command::Status(args) => commands::status::run(args, &cli.globals),
+        Command::Text(args) => commands::text::run(args, &cli.globals),
     }
 }
 

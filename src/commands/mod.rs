@@ -14,6 +14,7 @@
 //! match arm in `main.rs`.
 
 pub mod carousel;
+pub mod color;
 pub mod daemon;
 pub mod dashboard;
 pub mod gif;
@@ -24,4 +25,5 @@ pub mod on;
 pub mod probe;
 pub mod save;
 pub mod status;
+pub mod text;
 pub mod upload;
