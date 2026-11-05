@@ -16,7 +16,9 @@
 //! - **The lock** is held for one write only and sensors are read without it,
 //!   so an upload can take the bus between any two ticks. If an upload holds it,
 //!   the tick is skipped. That is normal operation: no error and no backoff.
-//! - **Failed writes** are retried on the next tick. See below.
+//! - **Failed writes** are retried on the next tick. See below. The adaptive
+//!   feed has no next tick to retry on, as [its section](self#the-adaptive-feed)
+//!   explains.
 //! - **Sensors** failing never stop the feed, which then shows zeros. A zero
 //!   reads as a failure, where a repeated value would look live.
 //! - **Shutdown** sends nothing: the panel is left exactly as it is.
@@ -54,6 +56,51 @@
 //! absorbed here too, at the cost of a frame or two, which a keep-alive does not
 //! mind.
 //!
+//! # Why the feed can be reduced
+//!
+//! The panel needs `E3`, but each one is an I2C write while the user may be
+//! gaming. Upstream (RTX 5080, Windows) measured 1% lows of about 141 fps with a
+//! 256-byte 1 Hz feed against about 182 with almost no writes, from writes of
+//! 9.8 ms. Real uploads on the RTX 5090 here took about 25 ms of kernel time per
+//! 256-byte write (10.6 s `sys` over 428 writes), which fits a 100 kHz bus. That
+//! number is from `sys` time during uploads: it was not measured on the `E3` path,
+//! and what either write costs in frame rate on this Linux driver is unknown.
+//!
+//! So [`DaemonConfig::feed`] and [`DaemonConfig::strategy`] can reduce the feed,
+//! while the defaults stay at the README's spec until hardware results justify
+//! more: `FeedFrameLen::Full` and [`FeedStrategy::Steady`]. 128-byte frames are
+//! unverified on a 5090. To have those results, every `E3` write is timed from
+//! after the lock is taken until the write returns: logged at debug level, and
+//! as count, mean and max at info level every [`WRITE_COST_REPORT_TICKS`] ticks.
+//! Only writes that went through count towards the summary.
+//!
+//! # The adaptive feed
+//!
+//! [`FeedStrategy::Adaptive`] polls the sensors on every tick regardless, since
+//! NVML reads cost nothing. Below [`ADAPTIVE_BUSY_PERCENT`] GPU utilization it
+//! sends each sample, as [`FeedStrategy::Steady`] does. From there up it collects
+//! [`ADAPTIVE_WINDOW_POLLS`] polls and sends a summary twice: the first on the
+//! last poll of the window, the second [`ADAPTIVE_PAIR_GAP_TICKS`] later. Upstream
+//! found that a frame only displays once the next one arrives within about 1 s,
+//! so a lone frame in a sparse feed would never show. That makes 2 writes every
+//! 6 seconds under load, and gaps of 5 seconds that the panel has to tolerate:
+//! seen upstream, unverified on a 5090.
+//!
+//! The schedule decides this from the polls alone and never hears how a write
+//! went, so nothing that happens on the bus can move the schedule:
+//!
+//! - **A half of a pair that fails or is skipped** is not sent again. The other
+//!   half goes on its own tick, and the next summary comes when it is due. A
+//!   retry would be the extra write under load that this feed exists to avoid.
+//!   At worst the panel shows the previous values for one more cycle.
+//! - **The failed-write count** works as ever, across the silent ticks, so three
+//!   failures in a row end the session. That can span 6 seconds rather than 2.
+//! - **A poll under the threshold** drops any partial window and any half of a
+//!   pair still due, and that sample goes out on that tick. A summary of a window
+//!   cut short would present a few polls as the whole, and the load it describes
+//!   has ended. In a pair, the live frame commits the first half just the same.
+//! - **A new session** starts with an empty window: its polls would be stale.
+//!
 //! # Suspend
 //!
 //! [`Instant`] does not advance during suspend on Linux, so resuming looks like
@@ -61,6 +108,7 @@
 //! Should the clock jump anyway, the deadline rule covers it.
 
 use std::io::Write;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -96,6 +144,46 @@ pub const POLL_SLICE: Duration = Duration::from_millis(100);
 /// Failed writes in a row that end a session. See the [module docs](self).
 pub const WRITE_ATTEMPTS: u32 = 3;
 
+/// The GPU utilization in percent from which [`FeedStrategy::Adaptive`] sends
+/// summaries instead of every sample.
+pub const ADAPTIVE_BUSY_PERCENT: u32 = 50;
+
+/// The polls that one summary of [`FeedStrategy::Adaptive`] covers.
+pub const ADAPTIVE_WINDOW_POLLS: usize = 5;
+
+/// Ticks between the two frames of a summary. The panel shows a frame once the
+/// next arrives within about 1 s, so this cannot grow. A poll in this gap only
+/// counts towards the threshold, not towards the next window.
+pub const ADAPTIVE_PAIR_GAP_TICKS: u32 = 1;
+
+/// Ticks between two summaries of the write cost at info level.
+pub const WRITE_COST_REPORT_TICKS: u64 = 60;
+
+/// How often `E3` goes out. See the [module docs](self#the-adaptive-feed).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FeedStrategy {
+    /// One frame per tick, the README's spec.
+    #[default]
+    Steady,
+    /// One frame per tick under low load, a summary as a pair of frames under
+    /// high load.
+    Adaptive,
+}
+
+impl FromStr for FeedStrategy {
+    type Err = Error;
+
+    fn from_str(name: &str) -> Result<Self> {
+        match name {
+            "steady" => Ok(Self::Steady),
+            "adaptive" => Ok(Self::Adaptive),
+            _ => Err(Error::InvalidArgument(format!(
+                "a feed strategy must be steady or adaptive, not {name}"
+            ))),
+        }
+    }
+}
+
 /// What the daemon shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DaemonConfig {
@@ -107,6 +195,8 @@ pub struct DaemonConfig {
     pub interval_s: u8,
     /// The length of each `E3`.
     pub feed: FeedFrameLen,
+    /// How often an `E3` goes out.
+    pub strategy: FeedStrategy,
     /// Stops after this many ticks. Only tests and dry-run set this.
     pub max_ticks: Option<u64>,
 }
@@ -118,6 +208,7 @@ impl Default for DaemonConfig {
             elements: None,
             interval_s: 3,
             feed: FeedFrameLen::Full,
+            strategy: FeedStrategy::Steady,
             max_ticks: None,
         }
     }
@@ -290,6 +381,7 @@ where
         backoff: Backoff::default(),
         connection: Problem::new("panel"),
         ticks: 0,
+        write_cost: WriteCost::default(),
     }
     .run()
 }
@@ -302,9 +394,24 @@ enum Link<T, W> {
 
 impl<T: Transport, W: Write> Link<T, W> {
     /// Sends one `E3`. The lock is taken for this write and released on return.
-    fn send(&mut self, sample: &SensorSample, feed: FeedFrameLen) -> Result<()> {
+    /// The time goes to `cost` without the lock around it, and only for the real
+    /// bus: a dry-run would time a print.
+    fn send(
+        &mut self,
+        sample: &SensorSample,
+        feed: FeedFrameLen,
+        clock: &impl Clock,
+        cost: &mut WriteCost,
+    ) -> Result<()> {
         match self {
-            Self::Live(unlocked) => Panel::new(unlocked.lock()?).send_sensors(sample, feed),
+            Self::Live(unlocked) => {
+                let bus = unlocked.lock()?;
+                let started = clock.now();
+                let result = Panel::new(bus).send_sensors(sample, feed);
+                let took = clock.now().saturating_duration_since(started);
+                cost.record(took, feed, result.is_ok());
+                result
+            }
             Self::DryRun(dry_run) => Panel::new(dry_run).send_sensors(sample, feed),
         }
     }
@@ -316,6 +423,125 @@ enum Ended {
     Stopped,
     /// The bus failed, so the session is gone.
     BusLost,
+}
+
+/// Decides from each poll what the tick sends, if anything. One lives for one
+/// session. See the [module docs](self#the-adaptive-feed).
+#[derive(Debug)]
+struct FeedSchedule {
+    strategy: FeedStrategy,
+    window: Vec<SensorSample>,
+    second_half: Option<SecondHalf>,
+}
+
+/// The frame of a pair that is still to go out.
+#[derive(Debug, Clone, Copy)]
+struct SecondHalf {
+    summary: SensorSample,
+    ticks_left: u32,
+}
+
+impl FeedSchedule {
+    fn new(strategy: FeedStrategy) -> Self {
+        Self {
+            strategy,
+            window: Vec::with_capacity(ADAPTIVE_WINDOW_POLLS),
+            second_half: None,
+        }
+    }
+
+    /// Takes this tick's poll and returns what to send on this tick. It takes no
+    /// outcome of a write, which is what keeps the schedule off the bus's state.
+    fn frame_for(&mut self, sample: SensorSample) -> Option<SensorSample> {
+        if self.strategy == FeedStrategy::Steady || sample.gpu_usage_percent < ADAPTIVE_BUSY_PERCENT
+        {
+            self.window.clear();
+            self.second_half = None;
+            return Some(sample);
+        }
+        if let Some(mut half) = self.second_half.take() {
+            half.ticks_left -= 1;
+            if half.ticks_left == 0 {
+                return Some(half.summary);
+            }
+            self.second_half = Some(half);
+            return None;
+        }
+        self.window.push(sample);
+        if self.window.len() < ADAPTIVE_WINDOW_POLLS {
+            return None;
+        }
+        let summary = summarize(&self.window);
+        self.window.clear();
+        self.second_half = Some(SecondHalf {
+            summary,
+            ticks_left: ADAPTIVE_PAIR_GAP_TICKS,
+        });
+        Some(summary)
+    }
+}
+
+/// One frame for a window of polls: the peaks of what can hurt the card, the
+/// average of what varies with the load, and the latest RAM usage, which only
+/// ever drifts. NVML has no FPS, so that stays 0.
+fn summarize(window: &[SensorSample]) -> SensorSample {
+    let max = |field: fn(&SensorSample) -> u32| window.iter().map(field).max().unwrap_or(0);
+    let average = |field: fn(&SensorSample) -> u32| rounded_mean(window.iter().map(field));
+    SensorSample {
+        gpu_temp_c: max(|sample| sample.gpu_temp_c),
+        gpu_clock_mhz: average(|sample| sample.gpu_clock_mhz),
+        gpu_usage_percent: average(|sample| sample.gpu_usage_percent),
+        fan_speed: max(|sample| sample.fan_speed),
+        ram_clock_mhz: average(|sample| sample.ram_clock_mhz),
+        ram_usage_percent: window.last().map_or(0, |sample| sample.ram_usage_percent),
+        fps: 0,
+        tgp_watts: max(|sample| sample.tgp_watts),
+    }
+}
+
+/// The mean to the nearest whole number. An empty list gives 0.
+fn rounded_mean(values: impl ExactSizeIterator<Item = u32>) -> u32 {
+    let count = values.len() as u64;
+    if count == 0 {
+        return 0;
+    }
+    // Sums in u64, since sensor values are as wide as the type: see `SensorSample`.
+    let sum: u64 = values.map(u64::from).sum();
+    u32::try_from((sum + count / 2) / count).unwrap_or(u32::MAX)
+}
+
+/// What `E3` writes have cost since the last report.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WriteCost {
+    count: u32,
+    total: Duration,
+    max: Duration,
+}
+
+impl WriteCost {
+    /// Logs one attempt. A failed one says little about the cost of a write, as a
+    /// transfer can fail at any point, so it stays out of the summary.
+    fn record(&mut self, took: Duration, feed: FeedFrameLen, ok: bool) {
+        let bytes = feed.bytes();
+        if !ok {
+            log::debug!("E3 write of {bytes} bytes failed after {took:.1?}");
+            return;
+        }
+        log::debug!("E3 write of {bytes} bytes took {took:.1?}");
+        self.count += 1;
+        self.total += took;
+        self.max = self.max.max(took);
+    }
+
+    /// Logs the summary and starts over. Says nothing if nothing was written, as
+    /// when an upload had the bus for the whole period.
+    fn report(&mut self) {
+        let Self { count, total, max } = std::mem::take(self);
+        if count > 0 {
+            let mean = total / count;
+            log::info!("E3 write cost: count {count}, mean {mean:.1?}, max {max:.1?}");
+        }
+    }
 }
 
 /// Grows from [`BACKOFF_FIRST`] to [`BACKOFF_MAX`].
@@ -448,6 +674,7 @@ struct Run<C, F, K, S> {
     backoff: Backoff,
     connection: Problem,
     ticks: u64,
+    write_cost: WriteCost,
 }
 
 impl<T, W, S, C, F, K> Run<C, F, K, S>
@@ -557,6 +784,7 @@ where
     fn feed(&mut self, mut link: Link<T, W>, pci_bus: Option<u32>) -> Result<Ended> {
         let mut deadline = self.clock.now();
         let mut failures = 0;
+        let mut schedule = FeedSchedule::new(self.config.strategy);
         while !self.out_of_ticks() && self.wait_until(deadline) {
             let sample = self.sensors.sample(self.clock.now(), pci_bus);
             // A sensor read can stall, and a shutdown sends nothing.
@@ -564,22 +792,30 @@ where
                 break;
             }
             self.ticks += 1;
-            match link.send(&sample, self.config.feed) {
-                Ok(()) => {
-                    failures = 0;
-                    self.backoff.reset();
-                    self.connection.clear();
-                }
-                Err(Error::LockBusy { .. }) => log::debug!("an upload holds the bus: tick skipped"),
-                Err(error) if self.is_fatal(&error) => return Err(error),
-                Err(error) => {
-                    failures += 1;
-                    if failures == WRITE_ATTEMPTS {
-                        self.connection.report(&error);
-                        return Ok(Ended::BusLost);
+            if let Some(frame) = schedule.frame_for(sample) {
+                let clock = &self.clock;
+                match link.send(&frame, self.config.feed, clock, &mut self.write_cost) {
+                    Ok(()) => {
+                        failures = 0;
+                        self.backoff.reset();
+                        self.connection.clear();
                     }
-                    log::debug!("write failed, trying again on the next tick: {error}");
+                    Err(Error::LockBusy { .. }) => {
+                        log::debug!("an upload holds the bus: tick skipped");
+                    }
+                    Err(error) if self.is_fatal(&error) => return Err(error),
+                    Err(error) => {
+                        failures += 1;
+                        if failures == WRITE_ATTEMPTS {
+                            self.connection.report(&error);
+                            return Ok(Ended::BusLost);
+                        }
+                        log::debug!("write failed, trying again on the next tick: {error}");
+                    }
                 }
+            }
+            if self.ticks.is_multiple_of(WRITE_COST_REPORT_TICKS) {
+                self.write_cost.report();
             }
             deadline = next_deadline(deadline, self.clock.now());
         }
@@ -662,6 +898,7 @@ mod tests {
         assert_eq!(config.dashboard().elements.bits(), 0xAF);
         assert_eq!(config.dashboard().interval_s, 3);
         assert_eq!(config.feed, FeedFrameLen::Full);
+        assert_eq!(config.strategy, FeedStrategy::Steady);
         assert_eq!(config.max_ticks, None);
     }
 
@@ -719,6 +956,115 @@ mod tests {
             let update = config.update_for(shown(0x00, interval_s));
             assert_eq!(update, Some(shown(0xAF, 3)));
         }
+    }
+
+    #[test]
+    fn a_feed_strategy_is_steady_or_adaptive_and_nothing_else() {
+        assert_eq!(
+            "steady".parse::<FeedStrategy>().unwrap(),
+            FeedStrategy::Steady
+        );
+        assert_eq!(
+            "adaptive".parse::<FeedStrategy>().unwrap(),
+            FeedStrategy::Adaptive
+        );
+
+        for name in ["", "Adaptive", "burst"] {
+            let error = name.parse::<FeedStrategy>().unwrap_err();
+            assert!(matches!(error, Error::InvalidArgument(_)), "{error:?}");
+        }
+    }
+
+    fn polling(usage: u32) -> SensorSample {
+        SensorSample {
+            gpu_usage_percent: usage,
+            ..SensorSample::default()
+        }
+    }
+
+    #[test]
+    fn the_window_summary_takes_peaks_averages_and_the_latest_ram_usage() {
+        let sample = |temp, clock, usage, fan, ram_clock, ram, power| SensorSample {
+            gpu_temp_c: temp,
+            gpu_clock_mhz: clock,
+            gpu_usage_percent: usage,
+            fan_speed: fan,
+            ram_clock_mhz: ram_clock,
+            ram_usage_percent: ram,
+            fps: 144,
+            tgp_watts: power,
+        };
+        let window = [
+            sample(60, 2000, 90, 1500, 14_000, 41, 300),
+            sample(75, 2100, 80, 1400, 14_000, 42, 450),
+            sample(70, 2200, 70, 1800, 14_002, 43, 400),
+        ];
+
+        assert_eq!(
+            summarize(&window),
+            SensorSample {
+                gpu_temp_c: 75,
+                gpu_clock_mhz: 2100,
+                gpu_usage_percent: 80,
+                fan_speed: 1800,
+                ram_clock_mhz: 14_001,
+                ram_usage_percent: 43,
+                fps: 0,
+                tgp_watts: 450,
+            }
+        );
+    }
+
+    #[test]
+    fn a_mean_rounds_to_the_nearest_and_cannot_overflow() {
+        let mean = |values: &[u32]| rounded_mean(values.iter().copied());
+
+        assert_eq!(mean(&[]), 0);
+        assert_eq!(mean(&[1, 2]), 2);
+        assert_eq!(mean(&[1, 1, 2]), 1);
+        assert_eq!(mean(&[u32::MAX; 5]), u32::MAX);
+    }
+
+    #[test]
+    fn steady_sends_every_sample_whatever_the_load() {
+        let mut schedule = FeedSchedule::new(FeedStrategy::Steady);
+
+        for usage in [0, 49, 50, 100, 100, 100, 100, 100, 100, 3] {
+            assert_eq!(schedule.frame_for(polling(usage)), Some(polling(usage)));
+        }
+    }
+
+    #[test]
+    fn adaptive_cycles_through_a_window_and_a_pair_under_load() {
+        let mut schedule = FeedSchedule::new(FeedStrategy::Adaptive);
+
+        let sent: Vec<bool> = (0..12)
+            .map(|_| schedule.frame_for(polling(50)).is_some())
+            .collect();
+
+        let cycle = [false, false, false, false, true, true];
+        assert_eq!(sent, [cycle, cycle].concat());
+    }
+
+    #[test]
+    fn the_write_cost_summary_covers_good_writes_and_starts_over() {
+        let mut cost = WriteCost::default();
+        let feed = FeedFrameLen::Full;
+
+        cost.record(Duration::from_millis(10), feed, true);
+        cost.record(Duration::from_millis(500), feed, false);
+        cost.record(Duration::from_millis(30), feed, true);
+
+        assert_eq!(
+            cost,
+            WriteCost {
+                count: 2,
+                total: Duration::from_millis(40),
+                max: Duration::from_millis(30),
+            }
+        );
+        cost.report();
+        assert_eq!(cost, WriteCost::default());
     }
 
     #[test]

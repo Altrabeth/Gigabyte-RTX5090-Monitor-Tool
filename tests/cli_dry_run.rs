@@ -90,6 +90,42 @@ fn daemon_dry_run_stops_at_max_ticks() {
     assert_eq!(frames(&stdout(&output), "E3"), 1);
 }
 
+#[test]
+fn daemon_dry_run_sends_the_frame_length_it_is_given() {
+    let output = dry_run_daemon(&["--max-ticks", "1", "--frame-bytes", "128"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("E3 SensorFeed (128 bytes)"), "{text}");
+}
+
+// How many frames this shows depends on the load of the machine running it.
+#[test]
+fn daemon_dry_run_accepts_the_adaptive_feed() {
+    let output = dry_run_daemon(&["--max-ticks", "1", "--feed", "adaptive"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert_eq!(frames(&text, "EB"), 1, "{text}");
+    assert_eq!(frames(&text, "AA"), 0, "{text}");
+}
+
+#[test]
+fn daemon_refuses_other_frame_lengths_and_strategies_before_doing_anything() {
+    for arguments in [["--frame-bytes", "64"], ["--feed", "burst"]] {
+        let output = dry_run_daemon(&arguments).output().unwrap();
+
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert_eq!(stdout(&output), "");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(arguments[1]), "{stderr}");
+    }
+}
+
 /// Sends `signal` to a dry-run that would otherwise last a minute, once its first
 /// `E3` is out. Returns its exit and how long that took. The limit in the tests
 /// is loose for a loaded machine, and still far under the minute.

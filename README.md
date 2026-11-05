@@ -133,7 +133,8 @@ rotation of the built-in screens plus stored user content. `F3` carousels accept
   field first and fall back to it.
 - The periodic I2C write can cost frame time. Upstream measured 1% lows of about 141 fps
   with a 256-byte 1 Hz feed against about 182 with almost no writes (RTX 5080, Windows,
-  unverified here). 128-byte `E3` frames and an adaptive feed reduce this.
+  unverified here). 128-byte `E3` frames (`--frame-bytes 128`) and an adaptive feed
+  (`--feed adaptive`) reduce this. Both stay off by default until measured on this card.
 
 ---
 
@@ -189,7 +190,7 @@ aorus-lcd text "hello" [--color ff8800] [--bg 000000] [--size 32] [--no-effect]
 aorus-lcd gif <file> [--frame-delay MS]
 aorus-lcd carousel 0,1,4 --interval 5
 aorus-lcd dashboard --widgets temp,clock,usage,fan,vram,power --interval 3
-aorus-lcd daemon [--config /etc/aorus-lcd.toml]
+aorus-lcd daemon [--config /etc/aorus-lcd.toml] [--frame-bytes 256|128] [--feed steady|adaptive]
 aorus-lcd save
 global: --bus N  --dry-run  -v
 ```
