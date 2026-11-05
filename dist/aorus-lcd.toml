@@ -19,14 +19,20 @@
 # E1 is only sent when widgets are named. A config with only this is an error.
 #interval = 3
 
-# How often the sensor frame goes out. "steady" sends one every second. "adaptive"
-# does too under 50% GPU usage, and from there up sends a 5-second summary, twice,
-# every 6 seconds. That means fewer writes while the GPU is busy, for values that
-# update less often.
-#feed = "steady"
+# How often the sensor frame goes out. "adaptive", the default, sends one every
+# second under 50% GPU usage, and from there up a pair of frames about every 6
+# seconds, carrying the peaks and averages of the last 5 seconds. That means fewer
+# writes while the GPU is busy, for values that update less often. "steady" sends
+# one every second at any load.
+#
+# On an RTX 5090 each frame stalled other NVIDIA driver calls by up to 35 ms. That
+# is a proxy for the cost, not a measured frame drop.
+#feed = "adaptive"
 
-# Bytes per sensor frame, 256 or 128. 256 is the known-good spec. 128 takes less
-# time on the bus, but it is untested on a 5090, so the panel may ignore it.
+# Bytes per sensor frame, 256 or 128. 256 is the default. 128 takes less time on
+# the bus, but it is unreliable on this card: an RTX 5090 refused 21 of 163 writes
+# at 128 bytes against 1 of 162 at 256, and 5 of 12 status polls failed during the
+# feed.
 #frame_bytes = 256
 
 # The I2C bus, instead of autodetecting. It must still be an NVIDIA adapter: any

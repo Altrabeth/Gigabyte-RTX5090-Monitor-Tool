@@ -68,10 +68,12 @@ fn frames(text: &str, opcode: &str) -> usize {
     text.lines().filter(|line| line.starts_with(&name)).count()
 }
 
-// `--max-ticks` is not passed: dry-run has to end by itself.
+// `--max-ticks` is not passed: dry-run has to end by itself. The steady feed,
+// because a dry-run reads the real sensors, and on a busy GPU the default feed
+// shows nothing in three ticks.
 #[test]
 fn daemon_dry_run_shows_the_probe_the_read_back_the_dashboard_and_three_ticks() {
-    let output = dry_run_daemon(&[]).output().unwrap();
+    let output = dry_run_daemon(&["--feed", "steady"]).output().unwrap();
 
     assert!(output.status.success(), "{output:?}");
     let text = stdout(&output);
@@ -82,9 +84,29 @@ fn daemon_dry_run_shows_the_probe_the_read_back_the_dashboard_and_three_ticks() 
     assert_eq!(frames(&text, "AA"), 0, "{text}");
 }
 
+// How many frames this shows depends on the load of the machine running it, but
+// a tick with no frame must be explained.
+#[test]
+fn daemon_dry_run_of_the_default_feed_shows_each_tick_or_says_why_not() {
+    let output = dry_run_daemon(&[]).output().unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert_eq!(frames(&text, "EB"), 1, "{text}");
+    assert_eq!(frames(&text, "DF"), 1, "{text}");
+    assert_eq!(frames(&text, "E1"), 1, "{text}");
+    assert_eq!(frames(&text, "AA"), 0, "{text}");
+    assert!(
+        frames(&text, "E3") == 3 || text.contains("waiting for a full window"),
+        "{text}"
+    );
+}
+
 #[test]
 fn daemon_dry_run_stops_at_max_ticks() {
-    let output = dry_run_daemon(&["--max-ticks", "1"]).output().unwrap();
+    let output = dry_run_daemon(&["--max-ticks", "1", "--feed", "steady"])
+        .output()
+        .unwrap();
 
     assert!(output.status.success(), "{output:?}");
     assert_eq!(frames(&stdout(&output), "E3"), 1);
@@ -92,9 +114,16 @@ fn daemon_dry_run_stops_at_max_ticks() {
 
 #[test]
 fn daemon_dry_run_sends_the_frame_length_it_is_given() {
-    let output = dry_run_daemon(&["--max-ticks", "1", "--frame-bytes", "128"])
-        .output()
-        .unwrap();
+    let output = dry_run_daemon(&[
+        "--max-ticks",
+        "1",
+        "--frame-bytes",
+        "128",
+        "--feed",
+        "steady",
+    ])
+    .output()
+    .unwrap();
 
     assert!(output.status.success(), "{output:?}");
     let text = stdout(&output);
@@ -130,7 +159,7 @@ fn daemon_refuses_other_frame_lengths_and_strategies_before_doing_anything() {
 /// `E3` is out. Returns its exit and how long that took. The limit in the tests
 /// is loose for a loaded machine, and still far under the minute.
 fn signalled_daemon(signal: &str) -> (Output, Duration) {
-    let mut child = dry_run_daemon(&["--max-ticks", "60"])
+    let mut child = dry_run_daemon(&["--max-ticks", "60", "--feed", "steady"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()

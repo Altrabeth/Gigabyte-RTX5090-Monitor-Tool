@@ -1,7 +1,7 @@
 //! The background loop that keeps the panel's sensor feed alive.
 //!
-//! The panel freezes or blanks its widgets without `E3` at about 1 Hz, so the
-//! goal here is that the feed outlives everything that can go wrong around it.
+//! The panel freezes or blanks its widgets without a regular `E3`, so the goal
+//! here is that the feed outlives everything that can go wrong around it.
 //! [`run_with`] is a state machine over injected parts, which is how every
 //! failure below is tested on a fake clock:
 //!
@@ -56,35 +56,41 @@
 //! absorbed here too, at the cost of a frame or two, which a keep-alive does not
 //! mind.
 //!
-//! # Why the feed can be reduced
+//! # Why the feed defaults to adaptive
 //!
 //! The panel needs `E3`, but each one is an I2C write while the user may be
 //! gaming. Upstream (RTX 5080, Windows) measured 1% lows of about 141 fps with a
 //! 256-byte 1 Hz feed against about 182 with almost no writes, from writes of
-//! 9.8 ms. Real uploads on the RTX 5090 here took about 25 ms of kernel time per
-//! 256-byte write (10.6 s `sys` over 428 writes), which fits a 100 kHz bus. That
-//! number is from `sys` time during uploads: it was not measured on the `E3` path,
-//! and what either write costs in frame rate on this Linux driver is unknown.
+//! 9.8 ms. On the RTX 5090 here (firmware 1.3, driver 615.78.08) a 256-byte `E3`
+//! takes 28 ms on average and 38 ms at most, which fits a 100 kHz bus. With the
+//! feed off, other NVIDIA driver calls showed no stall over 10 ms in 60 s. With a
+//! 1 Hz feed they stalled once per second, for up to 35 ms. That stall is a proxy,
+//! measured as `nvmlDeviceGetMemoryInfo` latency. It is not a measured game frame
+//! drop, and what the feed costs in frame rate on this Linux driver is unknown.
 //!
-//! So [`DaemonConfig::feed`] and [`DaemonConfig::strategy`] can reduce the feed,
-//! while the defaults stay at the README's spec until hardware results justify
-//! more: `FeedFrameLen::Full` and [`FeedStrategy::Steady`]. 128-byte frames are
-//! unverified on a 5090. To have those results, every `E3` write is timed from
-//! after the lock is taken until the write returns: logged at debug level, and
-//! as count, mean and max at info level every [`WRITE_COST_REPORT_TICKS`] ticks.
-//! Only writes that went through count towards the summary.
+//! So [`DaemonConfig::strategy`] defaults to [`FeedStrategy::Adaptive`], which
+//! writes less while the GPU is busy, and [`FeedStrategy::Steady`] stays available.
+//! [`DaemonConfig::feed`] stays at `FeedFrameLen::Full`. 128 bytes is less time on
+//! the bus, but on this card it is unreliable: 21 of 163 writes were refused,
+//! against 1 of 162 at 256 bytes, and 5 of 12 `status` polls failed during the feed.
+//!
+//! To judge changes here, every `E3` write is timed from after the lock is taken
+//! until the write returns: logged at debug level, and as count, mean and max at
+//! info level every [`WRITE_COST_REPORT_TICKS`] ticks. Only writes that went
+//! through count towards the summary.
 //!
 //! # The adaptive feed
 //!
 //! [`FeedStrategy::Adaptive`] polls the sensors on every tick regardless, since
 //! NVML reads cost nothing. Below [`ADAPTIVE_BUSY_PERCENT`] GPU utilization it
 //! sends each sample, as [`FeedStrategy::Steady`] does. From there up it collects
-//! [`ADAPTIVE_WINDOW_POLLS`] polls and sends a summary twice: the first on the
-//! last poll of the window, the second [`ADAPTIVE_PAIR_GAP_TICKS`] later. Upstream
-//! found that a frame only displays once the next one arrives within about 1 s,
-//! so a lone frame in a sparse feed would never show. That makes 2 writes every
-//! 6 seconds under load, and gaps of 5 seconds that the panel has to tolerate:
-//! seen upstream, unverified on a 5090.
+//! [`ADAPTIVE_WINDOW_POLLS`] polls and sends a summary of their peaks and averages
+//! twice: the first on the last poll of the window, the second
+//! [`ADAPTIVE_PAIR_GAP_TICKS`] later. Upstream found that a frame only displays
+//! once the next one arrives within about 1 s, so a lone frame in a sparse feed
+//! would never show. That makes 2 writes every 6 seconds under load, and gaps of
+//! 5 seconds that the panel has to tolerate. It does: on a 5090 the widgets stay
+//! visible and update about every 6 s, confirmed by eye.
 //!
 //! The schedule decides this from the polls alone and never hears how a write
 //! went, so nothing that happens on the bus can move the schedule:
@@ -100,6 +106,10 @@
 //!   cut short would present a few polls as the whole, and the load it describes
 //!   has ended. In a pair, the live frame commits the first half just the same.
 //! - **A new session** starts with an empty window: its polls would be stale.
+//!
+//! A dry-run reads the real sensors and lasts three ticks, so on a busy GPU it can
+//! end before the first summary. Its first silent tick prints a note, because
+//! output with no `E3` at all would look like a broken feed.
 //!
 //! # Suspend
 //!
@@ -163,10 +173,10 @@ pub const WRITE_COST_REPORT_TICKS: u64 = 60;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FeedStrategy {
     /// One frame per tick, the README's spec.
-    #[default]
     Steady,
     /// One frame per tick under low load, a summary as a pair of frames under
     /// high load.
+    #[default]
     Adaptive,
 }
 
@@ -208,7 +218,7 @@ impl Default for DaemonConfig {
             elements: None,
             interval_s: 3,
             feed: FeedFrameLen::Full,
-            strategy: FeedStrategy::Steady,
+            strategy: FeedStrategy::Adaptive,
             max_ticks: None,
         }
     }
@@ -413,6 +423,18 @@ impl<T: Transport, W: Write> Link<T, W> {
                 result
             }
             Self::DryRun(dry_run) => Panel::new(dry_run).send_sensors(sample, feed),
+        }
+    }
+
+    /// Says why a tick shows no frame. Only a dry-run has anyone to tell.
+    fn explain_silent_tick(&mut self) -> Result<()> {
+        match self {
+            Self::Live(_) => Ok(()),
+            Self::DryRun(dry_run) => dry_run.note(&format!(
+                "dry-run: GPU usage is {ADAPTIVE_BUSY_PERCENT}% or above, so the adaptive feed \
+                 is waiting for a full window and its next frame comes after \
+                 {ADAPTIVE_WINDOW_POLLS} polls; --feed steady shows one per tick"
+            )),
         }
     }
 }
@@ -785,6 +807,7 @@ where
         let mut deadline = self.clock.now();
         let mut failures = 0;
         let mut schedule = FeedSchedule::new(self.config.strategy);
+        let mut explained = false;
         while !self.out_of_ticks() && self.wait_until(deadline) {
             let sample = self.sensors.sample(self.clock.now(), pci_bus);
             // A sensor read can stall, and a shutdown sends nothing.
@@ -792,7 +815,12 @@ where
                 break;
             }
             self.ticks += 1;
-            if let Some(frame) = schedule.frame_for(sample) {
+            let frame = schedule.frame_for(sample);
+            if frame.is_none() && !explained {
+                link.explain_silent_tick()?;
+                explained = true;
+            }
+            if let Some(frame) = frame {
                 let clock = &self.clock;
                 match link.send(&frame, self.config.feed, clock, &mut self.write_cost) {
                     Ok(()) => {
@@ -898,8 +926,19 @@ mod tests {
         assert_eq!(config.dashboard().elements.bits(), 0xAF);
         assert_eq!(config.dashboard().interval_s, 3);
         assert_eq!(config.feed, FeedFrameLen::Full);
-        assert_eq!(config.strategy, FeedStrategy::Steady);
+        assert_eq!(config.strategy, FeedStrategy::Adaptive);
         assert_eq!(config.max_ticks, None);
+    }
+
+    #[test]
+    fn the_feed_defaults_to_adaptive_at_256_bytes() {
+        assert_eq!(FeedStrategy::default(), FeedStrategy::Adaptive);
+        assert_eq!(FeedFrameLen::default(), FeedFrameLen::Full);
+
+        let config = DaemonConfig::default();
+
+        assert_eq!(config.strategy, FeedStrategy::Adaptive);
+        assert_eq!(config.feed.bytes(), 256);
     }
 
     fn shown(mask: u8, interval_s: u8) -> DisplayStatus {

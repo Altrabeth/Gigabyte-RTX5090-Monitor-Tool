@@ -393,7 +393,7 @@ impl Rig {
     ) -> Result<()> {
         let config = DaemonConfig {
             max_ticks,
-            ..DaemonConfig::default()
+            ..steady()
         };
         self.run_configured(config, open_sensors)
     }
@@ -496,6 +496,15 @@ impl Rig {
             trace.iter().all(|sent| sent.at < asked_at),
             "sent after the stop request: {trace:?}"
         );
+    }
+}
+
+/// The steady feed, for tests of what happens on each tick. The default feed
+/// sends the same below its threshold, but these do not depend on that.
+fn steady() -> DaemonConfig {
+    DaemonConfig {
+        strategy: FeedStrategy::Steady,
+        ..DaemonConfig::default()
     }
 }
 
@@ -612,7 +621,7 @@ fn naming(mask: u8, interval_s: u8, ticks: u64) -> DaemonConfig {
         elements: Some(Elements::from_bits(mask)),
         interval_s,
         max_ticks: Some(ticks),
-        ..DaemonConfig::default()
+        ..steady()
     }
 }
 
@@ -771,7 +780,7 @@ fn the_feed_length_comes_from_the_config() {
     let config = DaemonConfig {
         feed: FeedFrameLen::Truncated,
         max_ticks: Some(1),
-        ..DaemonConfig::default()
+        ..steady()
     };
 
     run_with(
@@ -1437,7 +1446,7 @@ fn no_forbidden_frame_when_the_panel_keeps_its_widgets() {
     let rig = Rig::new();
     rig.panel_has(0xFF, 4);
 
-    run_through_everything(&rig, DaemonConfig::default());
+    run_through_everything(&rig, steady());
 
     assert_eq!(rig.attempts(DASHBOARD), []);
 }
@@ -1460,7 +1469,7 @@ fn no_forbidden_frame_when_the_panel_matches_the_named_widgets() {
 fn no_forbidden_frame_when_e1_is_needed_once() {
     let rig = Rig::new();
 
-    run_through_everything(&rig, DaemonConfig::default());
+    run_through_everything(&rig, steady());
 
     assert_eq!(rig.delivered(DASHBOARD).len(), 1);
 }
@@ -1470,7 +1479,7 @@ fn no_forbidden_frame_when_each_connection_needs_e1() {
     let rig = Rig::new();
     rig.device.forgets_e1.set(true);
 
-    run_through_everything(&rig, DaemonConfig::default());
+    run_through_everything(&rig, steady());
 
     let trace = rig.trace();
     let answered = rig.delivered(READ_BACK).len();
@@ -1547,6 +1556,23 @@ fn the_adaptive_constants_are_the_ones_upstream_measured_with() {
 }
 
 #[test]
+fn the_default_config_feeds_adaptively_at_full_length() {
+    let run_default_at = |usage| {
+        let rig = Rig::new();
+        let config = DaemonConfig {
+            max_ticks: Some(6),
+            ..DaemonConfig::default()
+        };
+        run_on(&rig, config, &[at_usage(usage)]);
+        assert!(rig.feed_frames().iter().all(|frame| frame.len() == 256));
+        rig.delivered(FEED)
+    };
+
+    assert_eq!(run_default_at(49), [0, 1000, 2000, 3000, 4000, 5000]);
+    assert_eq!(run_default_at(50), [4000, 5000]);
+}
+
+#[test]
 fn steady_sends_every_tick_at_either_length_whatever_the_load() {
     for feed in BOTH_LENGTHS {
         let rig = Rig::new();
@@ -1554,7 +1580,7 @@ fn steady_sends_every_tick_at_either_length_whatever_the_load() {
         let config = DaemonConfig {
             feed,
             max_ticks: Some(4),
-            ..DaemonConfig::default()
+            ..steady()
         };
 
         run_on(&rig, config, &samples);
@@ -2127,12 +2153,23 @@ impl Write for ClosedPipe {
     }
 }
 
-/// Runs a dry-run printing to clones of `output`, with no sensors.
+/// Runs a dry-run of the default feed printing to clones of `output`, with no
+/// sensors. That reads as zeros, which is under the adaptive threshold.
 fn dry_run<W: Write + Clone>(rig: &Rig, max_ticks: Option<u64>, output: W) -> Result<()> {
     let config = DaemonConfig {
         max_ticks,
         ..DaemonConfig::default()
     };
+    dry_run_on(rig, config, no_sensors, output)
+}
+
+/// Runs `config` as a dry-run printing to clones of `output`.
+fn dry_run_on<W: Write + Clone, S: SensorSource>(
+    rig: &Rig,
+    config: DaemonConfig,
+    open_sensors: impl FnMut(Option<u32>) -> Result<S>,
+    output: W,
+) -> Result<()> {
     run_with(
         config,
         Environment {
@@ -2140,7 +2177,7 @@ fn dry_run<W: Write + Clone>(rig: &Rig, max_ticks: Option<u64>, output: W) -> Re
                 let dry_run = DryRun::with_output(output.clone(), false);
                 Ok(Session::<Device, W>::DryRun(dry_run))
             },
-            open_sensors: no_sensors,
+            open_sensors,
             clock: rig.clock.clone(),
             stop: rig.stop.clone(),
             dry_run: true,
@@ -2163,6 +2200,82 @@ fn dry_run_prints_the_feed_with_zeros_if_there_are_no_sensors() {
     let feeds = text.lines().filter(|line| line.starts_with("E3 "));
     assert_eq!(feeds.count(), 3, "{text}");
     assert_eq!(rig.clock.elapsed_ms(), 2000);
+}
+
+/// What a dry-run of `config` prints at `usage` percent GPU usage.
+fn dry_run_text_at(usage: u32, config: DaemonConfig) -> String {
+    let rig = Rig::new();
+    let output = Output::default();
+    let polls = Polls::of(&[at_usage(usage)]);
+
+    dry_run_on(&rig, config, |_| Ok(polls.clone()), output.clone()).unwrap();
+
+    let text = String::from_utf8(output.0.borrow().clone()).unwrap();
+    text
+}
+
+fn feed_count(text: &str) -> usize {
+    text.lines().filter(|line| line.starts_with("E3 ")).count()
+}
+
+const WAITING: &str = "the adaptive feed is waiting for a full window";
+
+fn notes(text: &str) -> usize {
+    text.matches(WAITING).count()
+}
+
+#[test]
+fn a_dry_run_under_load_says_why_it_shows_no_feed() {
+    let config = DaemonConfig {
+        max_ticks: Some(3),
+        ..DaemonConfig::default()
+    };
+
+    let text = dry_run_text_at(90, config);
+
+    assert_eq!(feed_count(&text), 0, "{text}");
+    assert_eq!(notes(&text), 1, "{text}");
+    assert!(
+        text.contains("GPU usage is 50% or above"),
+        "not the threshold: {text}"
+    );
+    assert!(
+        text.contains("its next frame comes after 5 polls"),
+        "not the window: {text}"
+    );
+}
+
+#[test]
+fn a_dry_run_that_reaches_the_frames_says_so_only_once() {
+    let config = DaemonConfig {
+        max_ticks: Some(12),
+        ..DaemonConfig::default()
+    };
+
+    let text = dry_run_text_at(90, config);
+
+    assert_eq!(feed_count(&text), 4, "{text}");
+    assert_eq!(notes(&text), 1, "{text}");
+}
+
+#[test]
+fn a_dry_run_with_a_frame_on_each_tick_has_nothing_to_explain() {
+    let idle = DaemonConfig {
+        max_ticks: Some(3),
+        ..DaemonConfig::default()
+    };
+    let busy_but_steady = DaemonConfig {
+        max_ticks: Some(3),
+        ..steady()
+    };
+
+    for text in [
+        dry_run_text_at(49, idle),
+        dry_run_text_at(90, busy_but_steady),
+    ] {
+        assert_eq!(feed_count(&text), 3, "{text}");
+        assert_eq!(notes(&text), 0, "{text}");
+    }
 }
 
 #[test]

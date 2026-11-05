@@ -194,6 +194,17 @@ fn carousel_help_calls_it_an_interval_with_a_default_of_five() {
 }
 
 #[test]
+fn carousel_help_says_the_list_is_only_stored() {
+    let output = dry_run(&["carousel", "--help"]);
+
+    assert!(output.status.success(), "{output:?}");
+    let help = stdout(&output);
+    assert!(help.contains("F3 only stores this list"), "{help}");
+    assert!(help.contains("does not change the mode"), "{help}");
+    assert!(help.contains("`aorus-lcd mode 7`"), "{help}");
+}
+
+#[test]
 fn carousel_refuses_a_bad_list_before_printing() {
     assert_refused(&["carousel", "0,7"], "carousel modes must be 0 to 6, not 7");
     assert_refused(&["carousel", "7"], "carousel modes must be 0 to 6, not 7");
