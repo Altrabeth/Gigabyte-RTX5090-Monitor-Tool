@@ -17,6 +17,7 @@ use rustix::ioctl::{ioctl, Ioctl, IoctlOutput, Opcode};
 
 use crate::error::{Error, Result};
 use crate::panel::{Sleep, ThreadSleep};
+use crate::protocol::{opcode_name, MAGIC};
 
 /// A raw link to the panel controller.
 ///
@@ -249,10 +250,6 @@ fn errno_hint(source: &std::io::Error) -> Option<&'static str> {
     }
 }
 
-/// Every command frame carries this after the opcode. Payload chunks do not,
-/// which is how [`DryRun`] tells them apart. `docs/PROTOCOL.md` section 2.
-const COMMAND_MAGIC: [u8; 4] = [0xCB, 0x55, 0xAC, 0x38];
-
 /// How many bytes of a payload chunk its summary line shows.
 const SUMMARY_BYTES: usize = 8;
 
@@ -284,7 +281,8 @@ impl<W: Write> DryRun<W> {
 
     fn print_frame(&mut self, frame: &[u8]) -> std::io::Result<()> {
         let len = frame.len();
-        if frame.get(1..5) == Some(&COMMAND_MAGIC) {
+        // Payload chunks carry no magic, which tells them apart from commands.
+        if frame.get(1..5) == Some(&MAGIC) {
             let opcode = frame[0];
             let name = opcode_name(opcode);
             writeln!(self.out, "{opcode:02X} {name} ({len} bytes)")?;
@@ -312,29 +310,6 @@ impl<W: Write> Transport for DryRun<W> {
 
     fn read(&mut self, _buf: &mut [u8]) -> Result<()> {
         Err(Error::ReadbackUnavailable)
-    }
-}
-
-/// Names from the opcode table in `docs/PROTOCOL.md` section 2.
-fn opcode_name(opcode: u8) -> &'static str {
-    match opcode {
-        0xAA => "Save",
-        0xD6 => "GetFWVersion",
-        0xDE => "GetMode",
-        0xDF => "GetDisplay",
-        0xE1 => "SetDisplay",
-        0xE3 => "SensorFeed",
-        0xE5 => "SetMode",
-        0xE7 => "OpenLcd",
-        0xEA => "SetImageTpl",
-        0xEB => "GetImageTpl",
-        0xED => "GetImageTplData",
-        0xF1 => "UploadHeader",
-        0xF2 => "UploadMarker",
-        0xF3 => "SetLoop",
-        0xF4 => "GetLoop",
-        0xFA => "PowerOff",
-        _ => "unknown opcode",
     }
 }
 
@@ -549,7 +524,7 @@ mod tests {
     fn command_frame(opcode: u8) -> [u8; 256] {
         let mut frame = [0u8; 256];
         frame[0] = opcode;
-        frame[1..5].copy_from_slice(&COMMAND_MAGIC);
+        frame[1..5].copy_from_slice(&MAGIC);
         frame
     }
 
