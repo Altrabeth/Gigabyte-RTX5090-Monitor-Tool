@@ -172,7 +172,7 @@ pub const WRITE_COST_REPORT_TICKS: u64 = 60;
 /// How often `E3` goes out. See the [module docs](self#the-adaptive-feed).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FeedStrategy {
-    /// One frame per tick, the README's spec.
+    /// One frame per tick at any load.
     Steady,
     /// One frame per tick under low load, a summary as a pair of frames under
     /// high load.

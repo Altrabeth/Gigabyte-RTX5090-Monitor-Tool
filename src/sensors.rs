@@ -1,4 +1,4 @@
-//! Polls GPU sensors into [`SensorSample`](crate::protocol::SensorSample)s.
+//! Polls GPU sensors into [`SensorSample`]s.
 //!
 //! NVML is reached through `nvml-wrapper`, which `dlopen`s the library at
 //! runtime: the binary has no link-time dependency on the NVIDIA driver, and

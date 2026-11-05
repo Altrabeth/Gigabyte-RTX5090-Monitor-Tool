@@ -3,8 +3,7 @@
 //! [`Panel`] turns one operation into its frames, using the builders and parsers
 //! in [`protocol`](crate::protocol), and adds no policy: no retry, no fallback
 //! and no implicit frame. A failed transfer ends the operation at once, with
-//! nothing further written. To retry, wrap the link in
-//! [`Retrying`](crate::bus::transport::Retrying).
+//! nothing further written. To retry, wrap the link in [`Retrying`].
 //!
 //! # Over which link
 //!
@@ -49,8 +48,8 @@
 //! take about 6 seconds and a GIF longer. Three things stay with the caller, so
 //! that `Panel` remains generic over its link:
 //!
-//! - Retries: wrap the link in [`Retrying`](crate::bus::transport::Retrying). A
-//!   transfer the GPU's I2C engine rejects should not cost the whole upload.
+//! - Retries: wrap the link in [`Retrying`]. A transfer the GPU's I2C engine
+//!   rejects should not cost the whole upload.
 //! - The lock: a [`Verified`](crate::session::Verified) holds it for its whole
 //!   life, so running the upload on one keeps the daemon off the bus for every
 //!   pause. Do not use the per-write lock of [`Unlocked::lock`] here.
@@ -174,9 +173,9 @@ impl Sleep for RecordingSleep {
 
 /// One carousel bank as `F4` returned it.
 ///
-/// `raw` is the record. The slot offsets are inferred and have not been seen on
-/// real hardware, so interpreting them is a separate step, which can be
-/// corrected without losing what the panel sent.
+/// `raw` is the record, including bytes 4 to 7, whose meaning is unknown. The
+/// interval and slot offsets were confirmed on the real panel, but interpreting
+/// them stays a separate step, so nothing the panel sent is lost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoopBankRead {
     /// The bank number, 1 to 5.
@@ -305,7 +304,7 @@ pub enum RecoveryEvent {
 /// The panel's operations over a link. See the [module docs](self).
 ///
 /// Errors from the link are returned as they are. In dry-run that includes
-/// [`Error::ReadbackUnavailable`](crate::Error::ReadbackUnavailable) from every
+/// [`Error::ReadbackUnavailable`] from every
 /// read-back, once its query frame has been shown.
 #[derive(Debug)]
 pub struct Panel<T> {
@@ -346,7 +345,7 @@ impl<T: Transport> Panel<T> {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidArgument`](crate::Error::InvalidArgument), with nothing
+    /// [`Error::InvalidArgument`], with nothing
     /// sent, for a list [`carousel_frame`] refuses.
     pub fn set_carousel(&mut self, interval: u8, modes: &[Mode]) -> Result<()> {
         self.transport.write(&carousel_frame(interval, modes)?)
@@ -378,7 +377,7 @@ impl<T: Transport> Panel<T> {
     /// `upload_content` in `aorus_lcd.py`.
     ///
     /// Image and text payloads must already start with
-    /// [`DESCRIPTOR`](crate::protocol::DESCRIPTOR).
+    /// [`DESCRIPTOR`].
     ///
     /// `progress` is called after each frame of the upload, and not for
     /// `SetMode`. Pass `|_| {}` to ignore it.

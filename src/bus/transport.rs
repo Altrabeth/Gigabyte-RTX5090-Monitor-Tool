@@ -38,7 +38,7 @@ pub trait Transport {
     fn write(&mut self, frame: &[u8]) -> Result<()>;
 
     /// Fills all of `buf` from one I2C transfer. There is no byte count to
-    /// check: a partial read is [`Error::ShortRead`](crate::Error::ShortRead),
+    /// check: a partial read is [`Error::ShortRead`],
     /// so a caller cannot mistake it for a full read-back. `buf`'s contents
     /// are unspecified after an error.
     fn read(&mut self, buf: &mut [u8]) -> Result<()>;
