@@ -20,10 +20,15 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// No usable I2C adapter: none found, or `--bus` named a refused one. The
+    /// No usable I2C adapter was found, which can change as `i2c-dev` loads. The
     /// message should list what was seen.
     #[error("{0}")]
     Adapter(String),
+
+    /// `--bus` named an adapter that exists and must never receive a frame. Unlike
+    /// [`Error::Adapter`], time does not change this.
+    #[error("{0}")]
+    AdapterRefused(String),
 
     /// An I2C device operation failed. `context` says what was attempted and
     /// what the errno likely means; `source.raw_os_error()` tells transient

@@ -5,7 +5,7 @@
 //! only [`NvmlSensors::new`] fails where it is missing.
 //!
 //! Everything that decides a value is a pure function, so it is tested without
-//! a GPU. The only test that reaches NVML is the `#[ignore]`d live sample.
+//! a GPU. The only test here that reaches NVML is the `#[ignore]`d live sample.
 
 use std::ffi::OsStr;
 use std::fmt::Debug;

@@ -7,10 +7,11 @@
 //!
 //! # Why the gate cannot be skipped
 //!
-//! [`LinuxI2c`] has no public constructor, and [`connect`] is the only caller of
-//! its `pub(crate)` one. The handle goes straight into the gate, and leaves it
-//! only inside a [`Verified`], whose fields are private and which has no way to
-//! give the handle back. The compiler refuses both ways around that:
+//! [`LinuxI2c`] has no public constructor, and [`connect_waiting`], behind
+//! [`connect`], is the only caller of its `pub(crate)` one. The handle goes
+//! straight into the gate, and leaves it only inside a [`Verified`], whose fields
+//! are private and which has no way to give the handle back. The compiler refuses
+//! both ways around that:
 //!
 //! ```compile_fail,E0624
 //! let _ = aorus_lcd::bus::transport::LinuxI2c::open(0);
@@ -225,19 +226,30 @@ impl<T> Unlocked<T> {
 ///
 /// # Errors
 ///
-/// [`Error::Adapter`](crate::Error::Adapter) if no usable adapter exists or
-/// `--bus` was refused. [`Error::Lock`](crate::Error::Lock) or
+/// [`Error::Adapter`](crate::Error::Adapter) if no usable adapter exists.
+/// [`Error::AdapterRefused`](crate::Error::AdapterRefused) if `--bus` was refused.
+/// [`Error::Lock`](crate::Error::Lock) or
 /// [`Error::LockBusy`](crate::Error::LockBusy) if the bus lock cannot be had.
 /// [`Error::I2c`](crate::Error::I2c) or
 /// [`Error::ShortRead`](crate::Error::ShortRead) if the probe failed.
 pub fn connect(options: &Options) -> Result<Session> {
+    connect_waiting(options, ThreadSleep)
+}
+
+/// [`connect`], waiting for the bus lock through `sleep`, which lets the daemon
+/// cut the wait short on a signal.
+///
+/// # Errors
+///
+/// As for [`connect`].
+pub fn connect_waiting(options: &Options, sleep: impl Sleep) -> Result<Session> {
     connect_with(
         options,
         Environment {
             sysfs_root: SYSFS_ROOT.into(),
             lock_path: lock_path(),
             open: LinuxI2c::open,
-            sleep: ThreadSleep,
+            sleep,
             dry_run_output: io::stdout(),
         },
     )

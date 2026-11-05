@@ -114,7 +114,7 @@ fn check_override(adapters: &[Adapter], bus: u32) -> Result<&Adapter> {
         ));
     };
     if !adapter.name.starts_with(NVIDIA_ADAPTER_PREFIX) {
-        return Err(Error::Adapter(format!(
+        return Err(Error::AdapterRefused(format!(
             "refusing --bus {bus}: i2c-{bus} is \"{}\", not an NVIDIA adapter",
             adapter.name
         )));
@@ -328,7 +328,10 @@ mod tests {
         for name in [SMBUS, DESIGNWARE] {
             let sysfs = FakeSysfs::with_adapters(&[(0, PANEL), (8, name)]);
 
-            let text = message(discover(&sysfs.0, Some(8)).unwrap_err());
+            let error = discover(&sysfs.0, Some(8)).unwrap_err();
+
+            assert!(matches!(error, Error::AdapterRefused(_)), "{error:?}");
+            let text = error.to_string();
 
             assert!(text.contains("refusing --bus 8"), "{text}");
             assert!(text.contains(name), "{text}");

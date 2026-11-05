@@ -367,7 +367,8 @@ const RETRY_DELAY: Duration = Duration::from_millis(200);
 /// engine sometimes rejects a valid transfer while the bus is healthy, which
 /// would otherwise surface as a frozen panel.
 ///
-/// For uploads and the daemon. The probe stays on the raw transport, so that
+/// For uploads. The daemon retries on its next tick instead, see
+/// [`daemon`](crate::daemon). The probe stays on the raw transport, so that
 /// presence detection fails fast.
 #[derive(Debug)]
 pub struct Retrying<T, S = ThreadSleep> {
