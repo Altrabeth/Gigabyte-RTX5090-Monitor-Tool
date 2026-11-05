@@ -19,6 +19,9 @@ pub struct Args {
     /// to the panel's NVRAM
     #[arg(long)]
     pub save: bool,
+
+    #[arg(long, help = upload::NO_OVERLAY_HELP)]
+    pub no_overlay: bool,
 }
 
 /// Decodes the file, then uploads it. The decode comes first because connecting
@@ -29,7 +32,10 @@ pub fn run(args: Args, globals: &crate::Globals) -> Result<()> {
     upload::send(
         &payload,
         &UploadParams::still(Framebuffer::Static),
-        args.save,
+        upload::Finish {
+            clear_overlay: args.no_overlay,
+            persist: args.save,
+        },
         globals,
     )
 }
@@ -55,6 +61,26 @@ mod tests {
             .unwrap()
             .args;
         assert!(args.save);
+    }
+
+    #[test]
+    fn clearing_the_overlay_has_to_be_asked_for() {
+        let args = Harness::try_parse_from(["image", "a.png"]).unwrap().args;
+        assert!(!args.no_overlay);
+
+        let args = Harness::try_parse_from(["image", "a.png", "--no-overlay"])
+            .unwrap()
+            .args;
+        assert!(args.no_overlay);
+    }
+
+    // Rendered in-process so the test never has to run the binary.
+    #[test]
+    fn help_says_that_no_overlay_sends_e1() {
+        let help = Harness::command().render_help().to_string();
+
+        assert!(help.contains("--no-overlay"), "{help}");
+        assert!(help.contains("E1"), "{help}");
     }
 
     // Rendered in-process so the test never has to run the binary.

@@ -37,6 +37,12 @@ const MIN_CODE_SIZE: u8 = 7;
 const LZW_CLEAR: u8 = 128;
 const LZW_END: u8 = 129;
 
+/// The first row of `E1` with no widgets and interval 0, by hand from
+/// `docs/PROTOCOL.md` section 3: opcode, magic, flags `[5..12]`, interval `[13]`,
+/// padding.
+const CLEARED_E1_ROW: &str = "E1 CB 55 AC 38 00 00 00 00 00 00 00 00 00 00 00";
+const E1: &str = "E1 SetDisplay (256 bytes)";
+
 /// The rows that `F1` is zero in, after the first two.
 const ZERO_ROW: &str = "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00";
 
@@ -90,6 +96,14 @@ fn rows_after<'a>(dump: &'a str, header: &str, index: usize, count: usize) -> Ve
 
 fn f1_rows(dump: &str) -> Vec<&str> {
     rows_after(dump, "F1 ", 0, 3)
+}
+
+/// Exactly one `E1`, with every flag and the interval at zero.
+fn assert_one_cleared_e1(dump: &str) {
+    assert_eq!(dump.matches(E1).count(), 1, "{dump}");
+    let rows = rows_after(dump, "E1 ", 0, 16);
+    assert_eq!(rows[0], CLEARED_E1_ROW);
+    assert!(rows[1..].iter().all(|row| *row == ZERO_ROW), "{dump}");
 }
 
 /// One image of a fixture.
@@ -324,6 +338,71 @@ fn an_image_saves_only_when_asked_and_only_at_the_very_end() {
         rows_after(&saved, "AA ", 0, 1),
         ["AA CB 55 AC 38 00 00 00 00 00 00 00 00 00 00 00"]
     );
+}
+
+#[test]
+fn an_image_leaves_the_overlay_alone_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let png = png_of(&dir, 320, 170);
+
+    for options in [&[][..], &["--save"]] {
+        let dump = dump_of(&[&["image", text(&png)], options].concat());
+
+        assert!(!frame_sequence(&dump).contains(&E1), "{dump}");
+    }
+}
+
+#[test]
+fn no_overlay_clears_it_after_an_image_and_its_mode_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let png = png_of(&dir, 320, 170);
+
+    let plain = dump_of(&["image", text(&png)]);
+    let dump = dump_of(&["image", text(&png), "--no-overlay"]);
+
+    assert_one_cleared_e1(&dump);
+    let frames = frame_sequence(&dump);
+    assert_eq!(frames.len(), 432);
+    assert_eq!(frames[430..], ["E5 SetMode (256 bytes)", E1]);
+    assert!(dump.starts_with(&plain));
+}
+
+#[test]
+fn no_overlay_clears_it_before_an_image_is_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let png = png_of(&dir, 320, 170);
+
+    let dump = dump_of(&["image", text(&png), "--save", "--no-overlay"]);
+
+    assert_one_cleared_e1(&dump);
+    let frames = frame_sequence(&dump);
+    assert_eq!(frames.len(), 433);
+    assert_eq!(
+        frames[430..],
+        ["E5 SetMode (256 bytes)", E1, "AA Save (256 bytes)"]
+    );
+}
+
+#[test]
+fn a_gif_leaves_the_overlay_alone_by_default() {
+    let dump = gif_dump(&[Image::delayed(4)], &[]);
+
+    assert!(!frame_sequence(&dump).contains(&E1), "{dump}");
+}
+
+#[test]
+fn no_overlay_clears_it_after_a_gif_finishes_streaming() {
+    let plain = gif_dump(&[Image::delayed(4)], &[]);
+    let dump = gif_dump(&[Image::delayed(4)], &["--no-overlay"]);
+
+    assert_one_cleared_e1(&dump);
+    let frames = frame_sequence(&dump);
+    assert_eq!(frames[1], "E5 SetMode (256 bytes)");
+    assert_eq!(
+        frames[frames.len() - 2..],
+        ["F2 UploadMarker (256 bytes)", E1]
+    );
+    assert!(dump.starts_with(&plain));
 }
 
 #[test]
