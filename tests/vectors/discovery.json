@@ -1,0 +1,59 @@
+{
+  "commit": "b7f1fa8",
+  "cases": [
+    {
+      "name": "find_nvidia_bus_picks_adapter_1",
+      "source": "tests/test_encoders.py::test_find_nvidia_bus",
+      "lines": "310-317",
+      "stated": [
+        "0: \"SMBus PIIX4 adapter port 0 at 0b00\",",
+        "3: \"NVIDIA i2c adapter 1 at 1:00.0\",",
+        "4: \"NVIDIA i2c adapter 6 at 1:00.0\",",
+        "assert A.find_nvidia_bus(sys_root=root) == 3"
+      ],
+      "call": "find_nvidia_bus",
+      "input": {
+        "adapters": [
+          [0, "SMBus PIIX4 adapter port 0 at 0b00"],
+          [3, "NVIDIA i2c adapter 1 at 1:00.0"],
+          [4, "NVIDIA i2c adapter 6 at 1:00.0"]
+        ]
+      },
+      "expect": { "bus": 3 },
+      "note": "The reference's fake sysfs writes each name followed by a newline (line 306)."
+    },
+    {
+      "name": "list_adapters_first_entry",
+      "source": "tests/test_encoders.py::test_find_nvidia_bus",
+      "lines": "310-317",
+      "stated": [
+        "assert A.list_adapters(sys_root=root)[0] == (0, \"SMBus PIIX4 adapter port 0 at 0b00\")"
+      ],
+      "call": "list_adapters",
+      "input": {
+        "adapters": [
+          [0, "SMBus PIIX4 adapter port 0 at 0b00"],
+          [3, "NVIDIA i2c adapter 1 at 1:00.0"],
+          [4, "NVIDIA i2c adapter 6 at 1:00.0"]
+        ]
+      },
+      "expect": { "first": [0, "SMBus PIIX4 adapter port 0 at 0b00"] }
+    },
+    {
+      "name": "find_nvidia_bus_absent",
+      "source": "tests/test_encoders.py::test_find_nvidia_bus_absent",
+      "lines": "320-322",
+      "stated": [
+        "root = _fake_sysfs(tmp_path, {0: \"SMBus PIIX4 adapter port 0 at 0b00\"})",
+        "assert A.find_nvidia_bus(sys_root=root) is None"
+      ],
+      "call": "find_nvidia_bus",
+      "input": {
+        "adapters": [
+          [0, "SMBus PIIX4 adapter port 0 at 0b00"]
+        ]
+      },
+      "expect": { "bus": null }
+    }
+  ]
+}

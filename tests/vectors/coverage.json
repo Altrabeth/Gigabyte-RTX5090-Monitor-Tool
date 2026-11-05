@@ -1,0 +1,61 @@
+{
+  "commit": "b7f1fa8",
+  "entries": [
+    { "source": "tests/test_encoders.py::test_cmd_frame", "status": "vectors", "file": "frames.json" },
+    { "source": "tests/test_encoders.py::test_f2_frames", "status": "vectors", "file": "frames.json" },
+    { "source": "tests/test_encoders.py::test_f1_header_static_image", "status": "vectors", "file": "frames.json" },
+    { "source": "tests/test_encoders.py::test_f1_header_gif_flags_and_delay_clamp", "status": "vectors", "file": "frames.json" },
+    { "source": "tests/test_encoders.py::test_f1_header_small_payload_auto_mode", "status": "vectors", "file": "frames.json" },
+    { "source": "tests/test_encoders.py::test_chunk_payload_pads_and_counts", "status": "vectors", "file": "frames.json" },
+    { "source": "tests/test_encoders.py::test_chunk_payload_exact_multiple_adds_full_pad_chunk", "status": "vectors", "file": "frames.json" },
+    { "source": "tests/test_encoders.py::test_build_upload_shape", "status": "vectors", "file": "frames.json" },
+    { "source": "tests/test_encoders.py::test_image_to_le565_known_pixels", "status": "vectors", "file": "pixels.json" },
+    { "source": "tests/test_encoders.py::test_load_image_le565_resizes", "status": "vectors", "file": "pixels.json" },
+    { "source": "tests/test_encoders.py::test_render_text_le565", "status": "property", "file": "properties.json" },
+    { "source": "tests/test_encoders.py::test_gif_to_le565_frames", "status": "property", "file": "properties.json" },
+    { "source": "tests/test_encoders.py::test_rle_run", "status": "vectors", "file": "rle.json" },
+    { "source": "tests/test_encoders.py::test_rle_literal", "status": "vectors", "file": "rle.json" },
+    { "source": "tests/test_encoders.py::test_rle_short_tail_is_literal_even_if_equal", "status": "vectors", "file": "rle.json" },
+    { "source": "tests/test_encoders.py::test_rle_literal_then_run", "status": "vectors", "file": "rle.json" },
+    { "source": "tests/test_encoders.py::test_rle_round_trip_random_ish", "status": "property", "file": "properties.json" },
+    { "source": "tests/test_encoders.py::test_rle_rejects_tiny_frames", "status": "vectors", "file": "rle.json" },
+    { "source": "tests/test_encoders.py::test_gif_frame_table_offsets", "status": "vectors", "file": "rle.json" },
+    { "source": "tests/test_encoders.py::test_gif_payload_self_consistent", "status": "property", "file": "properties.json" },
+    { "source": "tests/test_encoders.py::test_build_gif_frames_wraps_payload", "status": "property", "file": "properties.json" },
+    {
+      "source": "tests/test_encoders.py::test_encoder_matches_gcc_ground_truth",
+      "status": "skipped",
+      "reason": "Needs GCC's animation.bin, a proprietary file that is in neither reference and cannot be committed here. The reference test skips itself when the file is absent, and it states no literal values."
+    },
+    { "source": "tests/test_encoders.py::test_find_nvidia_bus", "status": "vectors", "file": "discovery.json" },
+    { "source": "tests/test_encoders.py::test_find_nvidia_bus_absent", "status": "vectors", "file": "discovery.json" },
+    { "source": "tests/test_encoders.py::test_command_frames_on_the_wire", "status": "vectors", "file": "commands.json" },
+    { "source": "tests/test_encoders.py::test_read_cmd_writes_query_then_reads", "status": "vectors", "file": "commands.json" },
+    { "source": "tests/test_encoders.py::test_probe_is_a_status_query_not_a_quick_write", "status": "property", "file": "properties.json" },
+    { "source": "tests/test_encoders.py::test_probe_fails_when_readback_fails", "status": "property", "file": "properties.json" },
+    { "source": "tests/test_encoders.py::test_set_brightness_mask_and_value", "status": "vectors", "file": "commands.json" },
+    { "source": "tests/test_encoders.py::test_send_upload_pacing", "status": "vectors", "file": "sequencing.json" },
+    { "source": "tests/test_encoders.py::test_upload_content_mode_ordering", "status": "vectors", "file": "sequencing.json" },
+    {
+      "source": "tests/test_encoders.py::test_selftest_passes",
+      "status": "skipped",
+      "reason": "Only asserts that the reference's own run_selftest returns 0. Each of its nine checks is transcribed under its own aorus_lcd.py::run_selftest source."
+    },
+    {
+      "source": "tests/test_encoders.py::test_parser_wiring",
+      "status": "skipped",
+      "reason": "Asserts argparse wiring to Python function objects such as A.cli_mode. That is the shape of the Python CLI, not an encoder or wire fact, and the README defines the Rust CLI separately."
+    },
+    { "source": "tests/test_encoders.py::test_parse_hex_bytes", "status": "vectors", "file": "parsers.json" },
+    { "source": "tests/test_encoders.py::test_parse_color", "status": "vectors", "file": "parsers.json" },
+    { "source": "aorus_lcd.py::run_selftest::cmd_frame", "status": "vectors", "file": "frames.json" },
+    { "source": "aorus_lcd.py::run_selftest::f2_begin", "status": "vectors", "file": "frames.json" },
+    { "source": "aorus_lcd.py::run_selftest::f1_fields", "status": "vectors", "file": "frames.json" },
+    { "source": "aorus_lcd.py::run_selftest::f1_delay_clamp", "status": "vectors", "file": "frames.json" },
+    { "source": "aorus_lcd.py::run_selftest::chunk_pad", "status": "vectors", "file": "frames.json" },
+    { "source": "aorus_lcd.py::run_selftest::rle_run", "status": "vectors", "file": "rle.json" },
+    { "source": "aorus_lcd.py::run_selftest::rle_literal", "status": "vectors", "file": "rle.json" },
+    { "source": "aorus_lcd.py::run_selftest::rle_short_tail", "status": "vectors", "file": "rle.json" },
+    { "source": "aorus_lcd.py::run_selftest::gif_table", "status": "vectors", "file": "rle.json" }
+  ]
+}

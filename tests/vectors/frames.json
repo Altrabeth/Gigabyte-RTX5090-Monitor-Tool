@@ -1,0 +1,295 @@
+{
+  "commit": "b7f1fa8",
+  "cases": [
+    {
+      "name": "cmd_frame_e5_04",
+      "source": "tests/test_encoders.py::test_cmd_frame",
+      "lines": "13-17",
+      "stated": [
+        "fr = A.cmd_frame(0xE5, b\"\\x04\")",
+        "assert len(fr) == 256",
+        "assert fr[0] == 0xE5 and fr[1:5] == A.MAGIC and fr[5] == 0x04",
+        "assert not any(fr[6:]), \"tail must be zero-padded\""
+      ],
+      "call": "cmd_frame",
+      "input": { "opcode": "0xE5", "tail": "04" },
+      "expect": {
+        "len": 256,
+        "at": [
+          { "offset": 0, "hex": "e5" },
+          { "offset": 1, "hex": "cb 55 ac 38" },
+          { "offset": 5, "hex": "04" }
+        ],
+        "zero_from": 6
+      }
+    },
+    {
+      "name": "selftest_cmd_frame_e5_04",
+      "source": "aorus_lcd.py::run_selftest::cmd_frame",
+      "lines": "421",
+      "stated": [
+        "(\"cmd_frame\", lambda: cmd_frame(0xE5, b\"\\x04\")[:6] == bytes([0xE5]) + MAGIC + b\"\\x04\"),"
+      ],
+      "call": "cmd_frame",
+      "input": { "opcode": "0xE5", "tail": "04" },
+      "expect": {
+        "at": [ { "offset": 0, "hex": "e5 cb 55 ac 38 04" } ]
+      }
+    },
+    {
+      "name": "f2_begin",
+      "source": "tests/test_encoders.py::test_f2_frames",
+      "lines": "9, 20-24",
+      "stated": [
+        "F2 = bytes([0xF2, 0xCB, 0x55, 0xAC, 0x38])",
+        "b, e = A.f2_frame(1), A.f2_frame(2)",
+        "assert b[:6] == F2 + b\"\\x01\" and not any(b[6:])",
+        "assert len(b) == len(e) == 256"
+      ],
+      "call": "f2_frame",
+      "input": { "flag": 1 },
+      "expect": {
+        "len": 256,
+        "at": [ { "offset": 0, "hex": "f2 cb 55 ac 38 01" } ],
+        "zero_from": 6
+      }
+    },
+    {
+      "name": "f2_end",
+      "source": "tests/test_encoders.py::test_f2_frames",
+      "lines": "9, 20-24",
+      "stated": [
+        "F2 = bytes([0xF2, 0xCB, 0x55, 0xAC, 0x38])",
+        "b, e = A.f2_frame(1), A.f2_frame(2)",
+        "assert e[:6] == F2 + b\"\\x02\" and not any(e[6:])",
+        "assert len(b) == len(e) == 256"
+      ],
+      "call": "f2_frame",
+      "input": { "flag": 2 },
+      "expect": {
+        "len": 256,
+        "at": [ { "offset": 0, "hex": "f2 cb 55 ac 38 02" } ],
+        "zero_from": 6
+      }
+    },
+    {
+      "name": "selftest_f2_begin",
+      "source": "aorus_lcd.py::run_selftest::f2_begin",
+      "lines": "422",
+      "stated": [
+        "(\"f2_begin\", lambda: f2_frame(1)[:6] == bytes([0xF2]) + MAGIC + b\"\\x01\"),"
+      ],
+      "call": "f2_frame",
+      "input": { "flag": 1 },
+      "expect": {
+        "at": [ { "offset": 0, "hex": "f2 cb 55 ac 38 01" } ]
+      }
+    },
+    {
+      "name": "f1_header_static_image",
+      "source": "tests/test_encoders.py::test_f1_header_static_image",
+      "lines": "10, 27-37",
+      "stated": [
+        "F1 = bytes([0xF1, 0xCB, 0x55, 0xAC, 0x38])",
+        "# 12-byte descriptor + 108800 px bytes = 108812 -> 426 chunks, auto mode 2",
+        "usize = A.DESC_LEN + A.FRAME_BYTES",
+        "h = A.make_f1_header(A.FB_STATIC, usize // 256 + 1, 0, 0, usize)",
+        "assert h[:5] == F1 and len(h) == 256",
+        "assert h[5:9] == (0x01300000).to_bytes(4, \"big\")",
+        "assert h[9] == 1                                   # flag: static/text",
+        "assert int.from_bytes(h[10:14], \"big\") == 426      # chunk count",
+        "assert int.from_bytes(h[14:16], \"big\") == 0        # frame count",
+        "assert h[16] == 0 and h[17] == 2 and h[18] == 0    # delay, auto mode>=20480, pad",
+        "assert not any(h[19:])"
+      ],
+      "call": "make_f1_header",
+      "input": { "fb_addr": "0x01300000", "nchunks": 426, "nframes": 0, "delay": 0, "usize": 108812 },
+      "expect": {
+        "len": 256,
+        "at": [
+          { "offset": 0, "hex": "f1 cb 55 ac 38" },
+          { "offset": 5, "u32be": ["0x01300000"] },
+          { "offset": 9, "u8": [1] },
+          { "offset": 10, "u32be": [426] },
+          { "offset": 14, "u16be": [0] },
+          { "offset": 16, "u8": [0, 2, 0] }
+        ],
+        "zero_from": 19
+      },
+      "note": "The reference call omits flag and mode, so flag takes the signature default 1 and mode is auto."
+    },
+    {
+      "name": "selftest_f1_fields",
+      "source": "aorus_lcd.py::run_selftest::f1_fields",
+      "lines": "423-426",
+      "stated": [
+        "(\"f1_fields\", lambda: (lambda h: h[5:9] == b\"\\x01\\x30\\x00\\x00\"",
+        "and int.from_bytes(h[10:14], \"big\") == 426",
+        "and h[16] == 0 and h[17] == 2)",
+        "(make_f1_header(FB_STATIC, 426, 0, 0, DESC_LEN + FRAME_BYTES))),"
+      ],
+      "call": "make_f1_header",
+      "input": { "fb_addr": "0x01300000", "nchunks": 426, "nframes": 0, "delay": 0, "usize": 108812 },
+      "expect": {
+        "at": [
+          { "offset": 5, "hex": "01 30 00 00" },
+          { "offset": 10, "u32be": [426] },
+          { "offset": 16, "u8": [0, 2] }
+        ]
+      }
+    },
+    {
+      "name": "f1_header_gif_flags_and_delay_clamp",
+      "source": "tests/test_encoders.py::test_f1_header_gif_flags_and_delay_clamp",
+      "lines": "40-46",
+      "stated": [
+        "h = A.make_f1_header(A.FB_GIF, 10, 7, 999, 2500, flag=2, mode=2)",
+        "assert h[5:9] == b\"\\x00\\x00\\x00\\x00\"",
+        "assert h[9] == 2",
+        "assert int.from_bytes(h[14:16], \"big\") == 7",
+        "assert h[16] == 255, \"delay stored as min(255, delay)\"",
+        "assert h[17] == 2"
+      ],
+      "call": "make_f1_header",
+      "input": { "fb_addr": "0x00000000", "nchunks": 10, "nframes": 7, "delay": 999, "usize": 2500, "flag": 2, "mode": 2 },
+      "expect": {
+        "at": [
+          { "offset": 5, "hex": "00 00 00 00" },
+          { "offset": 9, "u8": [2] },
+          { "offset": 14, "u16be": [7] },
+          { "offset": 16, "u8": [255] },
+          { "offset": 17, "u8": [2] }
+        ]
+      },
+      "note": "Partial: the reference does not assert the prefix, the chunk count at [10..13], [18..] or the length here."
+    },
+    {
+      "name": "selftest_f1_delay_clamp",
+      "source": "aorus_lcd.py::run_selftest::f1_delay_clamp",
+      "lines": "427",
+      "stated": [
+        "(\"f1_delay_clamp\", lambda: make_f1_header(FB_GIF, 1, 1, 999, 100, flag=2, mode=2)[16] == 255),"
+      ],
+      "call": "make_f1_header",
+      "input": { "fb_addr": "0x00000000", "nchunks": 1, "nframes": 1, "delay": 999, "usize": 100, "flag": 2, "mode": 2 },
+      "expect": {
+        "at": [ { "offset": 16, "u8": [255] } ]
+      }
+    },
+    {
+      "name": "f1_header_small_payload_auto_mode",
+      "source": "tests/test_encoders.py::test_f1_header_small_payload_auto_mode",
+      "lines": "49-51",
+      "stated": [
+        "h = A.make_f1_header(A.FB_STATIC, 2, 0, 0, 300)   # < 20480 -> mode 1",
+        "assert h[17] == 1"
+      ],
+      "call": "make_f1_header",
+      "input": { "fb_addr": "0x01300000", "nchunks": 2, "nframes": 0, "delay": 0, "usize": 300 },
+      "expect": {
+        "at": [ { "offset": 17, "u8": [1] } ]
+      },
+      "note": "Partial: only the auto mode byte is asserted. The reference tests 300 and 108812, never the 20480 boundary itself."
+    },
+    {
+      "name": "chunk_payload_pads_and_counts",
+      "source": "tests/test_encoders.py::test_chunk_payload_pads_and_counts",
+      "lines": "54-60",
+      "stated": [
+        "p = bytes(range(256)) * 2 + b\"\\xAA\" * 10           # 522 bytes -> 3 chunks",
+        "chunks = A.chunk_payload(p)",
+        "assert len(chunks) == len(p) // 256 + 1 == 3",
+        "assert all(len(c) == 256 for c in chunks)",
+        "assert b\"\".join(chunks)[: len(p)] == p",
+        "assert not any(b\"\".join(chunks)[len(p):]), \"padding must be zero\""
+      ],
+      "call": "chunk_payload",
+      "input": {
+        "payload": [
+          { "byte_range": [0, 256], "repeat": 2 },
+          { "hex": "aa", "repeat": 10 }
+        ]
+      },
+      "expect": {
+        "count": 3,
+        "each_len": 256,
+        "joined": {
+          "at": [
+            { "offset": 0, "byte_range": [0, 256], "repeat": 2 },
+            { "offset": 512, "hex": "aa", "repeat": 10 }
+          ],
+          "zero_from": 522
+        }
+      }
+    },
+    {
+      "name": "chunk_payload_exact_multiple_adds_full_pad_chunk",
+      "source": "tests/test_encoders.py::test_chunk_payload_exact_multiple_adds_full_pad_chunk",
+      "lines": "63-69",
+      "stated": [
+        "# protocol-observed: chunk count is ALWAYS usize//256 + 1, so an exact",
+        "# multiple gets one extra all-zero chunk. Do not \"fix\" this.",
+        "p = b\"\\x11\" * 512",
+        "chunks = A.chunk_payload(p)",
+        "assert len(chunks) == 3",
+        "assert chunks[2] == bytes(256)"
+      ],
+      "call": "chunk_payload",
+      "input": { "payload": [ { "hex": "11", "repeat": 512 } ] },
+      "expect": {
+        "count": 3,
+        "items": [
+          { "index": 2, "exact": [ { "hex": "00", "repeat": 256 } ] }
+        ]
+      }
+    },
+    {
+      "name": "selftest_chunk_pad",
+      "source": "aorus_lcd.py::run_selftest::chunk_pad",
+      "lines": "428-429",
+      "stated": [
+        "(\"chunk_pad\", lambda: len(chunk_payload(b\"x\" * 512)) == 3",
+        "and chunk_payload(b\"x\" * 512)[2] == bytes(256)),"
+      ],
+      "call": "chunk_payload",
+      "input": { "payload": [ { "hex": "78", "repeat": 512 } ] },
+      "expect": {
+        "count": 3,
+        "items": [
+          { "index": 2, "exact": [ { "hex": "00", "repeat": 256 } ] }
+        ]
+      }
+    },
+    {
+      "name": "build_upload_shape",
+      "source": "tests/test_encoders.py::test_build_upload_shape",
+      "lines": "72-79",
+      "stated": [
+        "p = b\"\\x22\" * 300",
+        "frames = A.build_upload(p, A.FB_STATIC)",
+        "assert frames[0][:6] == F2 + b\"\\x01\"",
+        "assert frames[1][:5] == F1",
+        "assert frames[-1][:6] == F2 + b\"\\x02\"",
+        "assert len(frames) == 2 + (len(p) // 256 + 1) + 1",
+        "assert int.from_bytes(frames[1][10:14], \"big\") == len(p) // 256 + 1"
+      ],
+      "call": "build_upload",
+      "input": { "payload": [ { "hex": "22", "repeat": 300 } ], "fb_addr": "0x01300000" },
+      "expect": {
+        "count": 5,
+        "items": [
+          { "index": 0, "at": [ { "offset": 0, "hex": "f2 cb 55 ac 38 01" } ] },
+          {
+            "index": 1,
+            "at": [
+              { "offset": 0, "hex": "f1 cb 55 ac 38" },
+              { "offset": 10, "u32be": [2] }
+            ]
+          },
+          { "index": -1, "at": [ { "offset": 0, "hex": "f2 cb 55 ac 38 02" } ] }
+        ]
+      },
+      "note": "count is the stated 2 + (300 // 256 + 1) + 1, and the chunk count the stated 300 // 256 + 1. The reference call omits flag, nframes, delay and mode."
+    }
+  ]
+}

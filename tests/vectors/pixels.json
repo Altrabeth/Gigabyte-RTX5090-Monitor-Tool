@@ -1,0 +1,82 @@
+{
+  "commit": "b7f1fa8",
+  "cases": [
+    {
+      "name": "le565_solid_red",
+      "source": "tests/test_encoders.py::test_image_to_le565_known_pixels",
+      "lines": "87-96",
+      "stated": [
+        "# pure red: RGB565 0xF800 -> LE bytes 00 F8",
+        "red = A.image_to_le565(_solid_image((255, 0, 0)))",
+        "assert len(red) == A.FRAME_BYTES",
+        "assert red[:2] == b\"\\x00\\xf8\" and red == red[:2] * A.FRAME_PIXELS"
+      ],
+      "call": "image_to_le565",
+      "input": { "width": 320, "height": 170, "rgb": [255, 0, 0] },
+      "expect": {
+        "len": 108800,
+        "exact": [ { "hex": "00 f8", "repeat": 54400 } ]
+      }
+    },
+    {
+      "name": "le565_solid_green",
+      "source": "tests/test_encoders.py::test_image_to_le565_known_pixels",
+      "lines": "87-96",
+      "stated": [
+        "# pure green: 0x07E0 -> E0 07 ; pure blue: 0x001F -> 1F 00",
+        "assert A.image_to_le565(_solid_image((0, 255, 0)))[:2] == b\"\\xe0\\x07\""
+      ],
+      "call": "image_to_le565",
+      "input": { "width": 320, "height": 170, "rgb": [0, 255, 0] },
+      "expect": {
+        "at": [ { "offset": 0, "hex": "e0 07" } ]
+      }
+    },
+    {
+      "name": "le565_solid_blue",
+      "source": "tests/test_encoders.py::test_image_to_le565_known_pixels",
+      "lines": "87-96",
+      "stated": [
+        "# pure green: 0x07E0 -> E0 07 ; pure blue: 0x001F -> 1F 00",
+        "assert A.image_to_le565(_solid_image((0, 0, 255)))[:2] == b\"\\x1f\\x00\""
+      ],
+      "call": "image_to_le565",
+      "input": { "width": 320, "height": 170, "rgb": [0, 0, 255] },
+      "expect": {
+        "at": [ { "offset": 0, "hex": "1f 00" } ]
+      }
+    },
+    {
+      "name": "le565_low_bits_truncated",
+      "source": "tests/test_encoders.py::test_image_to_le565_known_pixels",
+      "lines": "87-96",
+      "stated": [
+        "# low bits are truncated, not rounded: (7,3,7) -> 0",
+        "assert A.image_to_le565(_solid_image((7, 3, 7)))[:2] == b\"\\x00\\x00\""
+      ],
+      "call": "image_to_le565",
+      "input": { "width": 320, "height": 170, "rgb": [7, 3, 7] },
+      "expect": {
+        "at": [ { "offset": 0, "hex": "00 00" } ]
+      }
+    },
+    {
+      "name": "load_image_resizes_solid_white",
+      "source": "tests/test_encoders.py::test_load_image_le565_resizes",
+      "lines": "99-105",
+      "stated": [
+        "Image.new(\"RGB\", (64, 64), (255, 255, 255)).save(p)",
+        "out = A.load_image_le565(str(p))",
+        "assert len(out) == A.FRAME_BYTES",
+        "assert out[:2] == b\"\\xff\\xff\""
+      ],
+      "call": "load_image_le565",
+      "input": { "width": 64, "height": 64, "rgb": [255, 255, 255], "format": "png" },
+      "expect": {
+        "len": 108800,
+        "at": [ { "offset": 0, "hex": "ff ff" } ]
+      },
+      "note": "The input is described, not committed: any PNG encoding of a solid 64x64 white image suits this case."
+    }
+  ]
+}

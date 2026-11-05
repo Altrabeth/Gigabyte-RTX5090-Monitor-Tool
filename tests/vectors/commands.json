@@ -1,0 +1,179 @@
+{
+  "commit": "b7f1fa8",
+  "cases": [
+    {
+      "name": "open_lcd_on",
+      "source": "tests/test_encoders.py::test_command_frames_on_the_wire",
+      "lines": "335-350",
+      "stated": [
+        "A.open_lcd(bus, True)",
+        "ops = [(w[0], w[5], w[6:9]) for w in bus.writes]",
+        "assert ops[0][:2] == (0xE7, 1)",
+        "assert all(w[1:5] == A.MAGIC and len(w) == 256 for w in bus.writes)"
+      ],
+      "call": "open_lcd",
+      "input": { "on": true },
+      "expect": {
+        "len": 256,
+        "at": [
+          { "offset": 0, "hex": "e7" },
+          { "offset": 1, "hex": "cb 55 ac 38" },
+          { "offset": 5, "u8": [1] }
+        ]
+      }
+    },
+    {
+      "name": "open_lcd_off",
+      "source": "tests/test_encoders.py::test_command_frames_on_the_wire",
+      "lines": "335-350",
+      "stated": [
+        "A.open_lcd(bus, False)",
+        "ops = [(w[0], w[5], w[6:9]) for w in bus.writes]",
+        "assert ops[1][:2] == (0xE7, 2)",
+        "assert all(w[1:5] == A.MAGIC and len(w) == 256 for w in bus.writes)"
+      ],
+      "call": "open_lcd",
+      "input": { "on": false },
+      "expect": {
+        "len": 256,
+        "at": [
+          { "offset": 0, "hex": "e7" },
+          { "offset": 1, "hex": "cb 55 ac 38" },
+          { "offset": 5, "u8": [2] }
+        ]
+      }
+    },
+    {
+      "name": "set_mode_3",
+      "source": "tests/test_encoders.py::test_command_frames_on_the_wire",
+      "lines": "335-350",
+      "stated": [
+        "A.set_mode(bus, 3)",
+        "ops = [(w[0], w[5], w[6:9]) for w in bus.writes]",
+        "assert ops[2][:2] == (0xE5, 4)",
+        "assert all(w[1:5] == A.MAGIC and len(w) == 256 for w in bus.writes)"
+      ],
+      "call": "set_mode",
+      "input": { "mode": 3 },
+      "expect": {
+        "len": 256,
+        "at": [
+          { "offset": 0, "hex": "e5" },
+          { "offset": 1, "hex": "cb 55 ac 38" },
+          { "offset": 5, "u8": [4] }
+        ]
+      }
+    },
+    {
+      "name": "set_mode_7_quirk",
+      "source": "tests/test_encoders.py::test_command_frames_on_the_wire",
+      "lines": "335-350",
+      "stated": [
+        "A.set_mode(bus, 7)      # quirk: mode 7 sends 9+1",
+        "ops = [(w[0], w[5], w[6:9]) for w in bus.writes]",
+        "assert ops[3][:2] == (0xE5, 10)",
+        "assert all(w[1:5] == A.MAGIC and len(w) == 256 for w in bus.writes)"
+      ],
+      "call": "set_mode",
+      "input": { "mode": 7 },
+      "expect": {
+        "len": 256,
+        "at": [
+          { "offset": 0, "hex": "e5" },
+          { "offset": 1, "hex": "cb 55 ac 38" },
+          { "offset": 5, "u8": [10] }
+        ]
+      }
+    },
+    {
+      "name": "set_carousel_0_1_4_arg_2",
+      "source": "tests/test_encoders.py::test_command_frames_on_the_wire",
+      "lines": "335-350",
+      "stated": [
+        "A.set_carousel(bus, [0, 1, 4], arg=2)",
+        "ops = [(w[0], w[5], w[6:9]) for w in bus.writes]",
+        "assert ops[4] == (0xF3, 2, bytes([1, 2, 5]))",
+        "assert all(w[1:5] == A.MAGIC and len(w) == 256 for w in bus.writes)"
+      ],
+      "call": "set_carousel",
+      "input": { "modes": [0, 1, 4], "arg": 2 },
+      "expect": {
+        "len": 256,
+        "at": [
+          { "offset": 0, "hex": "f3" },
+          { "offset": 1, "hex": "cb 55 ac 38" },
+          { "offset": 5, "u8": [2] },
+          { "offset": 6, "u8": [1, 2, 5] }
+        ]
+      },
+      "note": "arg is the interval byte in PROTOCOL.md section 2."
+    },
+    {
+      "name": "power_off_mode",
+      "source": "tests/test_encoders.py::test_command_frames_on_the_wire",
+      "lines": "335-350",
+      "stated": [
+        "A.power_off_mode(bus)",
+        "ops = [(w[0], w[5], w[6:9]) for w in bus.writes]",
+        "assert ops[5][0] == 0xFA",
+        "assert all(w[1:5] == A.MAGIC and len(w) == 256 for w in bus.writes)"
+      ],
+      "call": "power_off_mode",
+      "input": {},
+      "expect": {
+        "len": 256,
+        "at": [
+          { "offset": 0, "hex": "fa" },
+          { "offset": 1, "hex": "cb 55 ac 38" }
+        ]
+      },
+      "out_of_scope": "FA poweroff mode is excluded by tracker rule 6. Kept so the transcription is complete; no builder should exist for it."
+    },
+    {
+      "name": "read_cmd_eb_03",
+      "source": "tests/test_encoders.py::test_read_cmd_writes_query_then_reads",
+      "lines": "355, 373-379",
+      "stated": [
+        "def __init__(self, reply=bytes.fromhex(\"ff ff ff 00 00 00 00 00\"), fail_read=False):",
+        "data = A.read_cmd(bus, 0xEB)",
+        "assert w[0] == 0xEB and w[1:5] == A.MAGIC and w[5] == 0x03 and len(w) == 256",
+        "assert bus.reads == 1",
+        "assert data == bus.reply"
+      ],
+      "call": "read_cmd",
+      "input": { "opcode": "0xEB", "canned_reply": "ff ff ff 00 00 00 00 00" },
+      "expect": {
+        "len": 256,
+        "at": [
+          { "offset": 0, "hex": "eb" },
+          { "offset": 1, "hex": "cb 55 ac 38" },
+          { "offset": 5, "hex": "03" }
+        ],
+        "reads": 1,
+        "returns_canned_reply": true
+      },
+      "note": "canned_reply is a fixture from FakeStatusBus, not a capture from a panel. The byte checks describe the single write; the reference tail defaults to 03."
+    },
+    {
+      "name": "set_brightness_mask_and_value",
+      "source": "tests/test_encoders.py::test_set_brightness_mask_and_value",
+      "lines": "410-416",
+      "stated": [
+        "A.set_brightness(bus, 200, mask=0x05)",
+        "assert w[0] == 0xE1",
+        "assert w[5:13] == bytes([1, 0, 1, 0, 0, 0, 0, 0])",
+        "assert w[13] == 200"
+      ],
+      "call": "set_brightness",
+      "input": { "value": 200, "mask": "0x05" },
+      "expect": {
+        "at": [
+          { "offset": 0, "hex": "e1" },
+          { "offset": 5, "u8": [1, 0, 1, 0, 0, 0, 0, 0] },
+          { "offset": 13, "u8": [200] }
+        ]
+      },
+      "note": "The brightness command is excluded by tracker rule 6, but these are the E1 bytes of PROTOCOL.md section 3, so use the case for the E1 builder: element mask 0x05 and interval byte 200. PROTOCOL.md says the brightness meaning is unconfirmed."
+    }
+  ]
+}

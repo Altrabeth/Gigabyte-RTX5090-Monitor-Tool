@@ -1,0 +1,175 @@
+{
+  "commit": "b7f1fa8",
+  "cases": [
+    {
+      "name": "rle_run",
+      "source": "tests/test_encoders.py::test_rle_run",
+      "lines": "163-165",
+      "stated": [
+        "px = _px(*[0x1234] * 6)",
+        "assert A.rle_encode_frame(px) == b\"\\x06\\x80\" + _px(0x1234)"
+      ],
+      "call": "rle_encode_frame",
+      "input": { "px": [ { "u16le": ["0x1234"], "repeat": 6 } ] },
+      "expect": {
+        "exact": [ { "hex": "06 80" }, { "u16le": ["0x1234"] } ]
+      }
+    },
+    {
+      "name": "selftest_rle_run",
+      "source": "aorus_lcd.py::run_selftest::rle_run",
+      "lines": "430",
+      "stated": [
+        "(\"rle_run\", lambda: rle_encode_frame(px(*[0x1234] * 6)) == b\"\\x06\\x80\" + px(0x1234)),"
+      ],
+      "call": "rle_encode_frame",
+      "input": { "px": [ { "u16le": ["0x1234"], "repeat": 6 } ] },
+      "expect": {
+        "exact": [ { "hex": "06 80" }, { "u16le": ["0x1234"] } ]
+      }
+    },
+    {
+      "name": "rle_literal",
+      "source": "tests/test_encoders.py::test_rle_literal",
+      "lines": "168-170",
+      "stated": [
+        "px = _px(1, 2, 1, 2, 1, 2)",
+        "assert A.rle_encode_frame(px) == b\"\\x06\\x00\" + px"
+      ],
+      "call": "rle_encode_frame",
+      "input": { "px": [ { "u16le": [1, 2, 1, 2, 1, 2] } ] },
+      "expect": {
+        "exact": [ { "hex": "06 00" }, { "u16le": [1, 2, 1, 2, 1, 2] } ]
+      }
+    },
+    {
+      "name": "selftest_rle_literal",
+      "source": "aorus_lcd.py::run_selftest::rle_literal",
+      "lines": "431",
+      "stated": [
+        "(\"rle_literal\", lambda: rle_encode_frame(px(1, 2, 1, 2, 1, 2)) == b\"\\x06\\x00\" + px(1, 2, 1, 2, 1, 2)),"
+      ],
+      "call": "rle_encode_frame",
+      "input": { "px": [ { "u16le": [1, 2, 1, 2, 1, 2] } ] },
+      "expect": {
+        "exact": [ { "hex": "06 00" }, { "u16le": [1, 2, 1, 2, 1, 2] } ]
+      }
+    },
+    {
+      "name": "rle_short_tail_is_literal_even_if_equal",
+      "source": "tests/test_encoders.py::test_rle_short_tail_is_literal_even_if_equal",
+      "lines": "173-176",
+      "stated": [
+        "# <4 px left in the window -> whole window is ONE literal, even all-equal.",
+        "px = _px(7, 7, 7)",
+        "assert A.rle_encode_frame(px) == b\"\\x03\\x00\" + px"
+      ],
+      "call": "rle_encode_frame",
+      "input": { "px": [ { "u16le": [7, 7, 7] } ] },
+      "expect": {
+        "exact": [ { "hex": "03 00" }, { "u16le": [7, 7, 7] } ]
+      }
+    },
+    {
+      "name": "selftest_rle_short_tail",
+      "source": "aorus_lcd.py::run_selftest::rle_short_tail",
+      "lines": "432",
+      "stated": [
+        "(\"rle_short_tail\", lambda: rle_encode_frame(px(7, 7, 7)) == b\"\\x03\\x00\" + px(7, 7, 7)),"
+      ],
+      "call": "rle_encode_frame",
+      "input": { "px": [ { "u16le": [7, 7, 7] } ] },
+      "expect": {
+        "exact": [ { "hex": "03 00" }, { "u16le": [7, 7, 7] } ]
+      }
+    },
+    {
+      "name": "rle_literal_then_run",
+      "source": "tests/test_encoders.py::test_rle_literal_then_run",
+      "lines": "179-184",
+      "stated": [
+        "px = _px(1, 2) + _px(*[9] * 4) + _px(5, 6, 7, 8, 5, 6)",
+        "got = A.rle_encode_frame(px)",
+        "assert got == (b\"\\x02\\x00\" + _px(1, 2)",
+        "+ b\"\\x04\\x80\" + _px(9)",
+        "+ b\"\\x06\\x00\" + _px(5, 6, 7, 8, 5, 6))"
+      ],
+      "call": "rle_encode_frame",
+      "input": {
+        "px": [
+          { "u16le": [1, 2] },
+          { "u16le": [9], "repeat": 4 },
+          { "u16le": [5, 6, 7, 8, 5, 6] }
+        ]
+      },
+      "expect": {
+        "exact": [
+          { "hex": "02 00" }, { "u16le": [1, 2] },
+          { "hex": "04 80" }, { "u16le": [9] },
+          { "hex": "06 00" }, { "u16le": [5, 6, 7, 8, 5, 6] }
+        ]
+      }
+    },
+    {
+      "name": "rle_rejects_tiny_frames",
+      "source": "tests/test_encoders.py::test_rle_rejects_tiny_frames",
+      "lines": "198-201",
+      "stated": [
+        "with pytest.raises(ValueError):",
+        "A.rle_encode_frame(_px(1, 2))"
+      ],
+      "call": "rle_encode_frame",
+      "input": { "px": [ { "u16le": [1, 2] } ] },
+      "expect": { "error": "ValueError" },
+      "note": "Two pixels must be rejected. ValueError stands for any error; the Rust error type is up to the encoder."
+    },
+    {
+      "name": "gif_frame_table_offsets",
+      "source": "tests/test_encoders.py::test_gif_frame_table_offsets",
+      "lines": "204-213",
+      "stated": [
+        "# sizes [10, 20], N=2: header = 2 + 10*2 = 22 bytes.",
+        "# entry u32 = inclusive end offset: 22+10-1 = 31, then 32+20-1 = 51.",
+        "t = A.gif_frame_table([10, 20])",
+        "assert struct.unpack_from(\"<H\", t, 0)[0] == 2",
+        "e0 = struct.unpack_from(\"<IHHH\", t, 2)",
+        "e1 = struct.unpack_from(\"<IHHH\", t, 12)",
+        "assert e0 == (31, A.W, A.H, 3)",
+        "assert e1 == (51, A.W, A.H, 3)",
+        "assert len(t) == 22"
+      ],
+      "call": "gif_frame_table",
+      "input": { "sizes": [10, 20] },
+      "expect": {
+        "len": 22,
+        "at": [
+          { "offset": 0, "u16le": [2] },
+          { "offset": 2, "u32le": [31] },
+          { "offset": 6, "u16le": [320, 170, 3] },
+          { "offset": 12, "u32le": [51] },
+          { "offset": 16, "u16le": [320, 170, 3] }
+        ]
+      }
+    },
+    {
+      "name": "selftest_gif_table",
+      "source": "aorus_lcd.py::run_selftest::gif_table",
+      "lines": "433-436",
+      "stated": [
+        "(\"gif_table\", lambda: gif_frame_table([10, 20])",
+        "== b\"\\x02\\x00\"",
+        "+ (31).to_bytes(4, \"little\") + px(W, H, 3)",
+        "+ (51).to_bytes(4, \"little\") + px(W, H, 3)),"
+      ],
+      "call": "gif_frame_table",
+      "input": { "sizes": [10, 20] },
+      "expect": {
+        "exact": [
+          { "hex": "02 00" },
+          { "u32le": [31] }, { "u16le": [320, 170, 3] },
+          { "u32le": [51] }, { "u16le": [320, 170, 3] }
+        ]
+      }
+    }
+  ]
+}

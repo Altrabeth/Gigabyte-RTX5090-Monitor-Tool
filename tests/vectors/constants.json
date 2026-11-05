@@ -1,0 +1,19 @@
+{
+  "commit": "b7f1fa8",
+  "constants": {
+    "W": { "value": 320, "source": "aorus_lcd.py:31", "stated": "W, H = 320, 170" },
+    "H": { "value": 170, "source": "aorus_lcd.py:31", "stated": "W, H = 320, 170" },
+    "FRAME_PIXELS": { "value": 54400, "source": "aorus_lcd.py:32", "stated": "FRAME_PIXELS = W * H" },
+    "FRAME_BYTES": { "value": 108800, "source": "aorus_lcd.py:33", "stated": "FRAME_BYTES = FRAME_PIXELS * 2          # 108800 (LE-RGB565)" },
+    "DESC": { "value": "01 00 0b a9 01 00 40 01 aa 00 01 00", "source": "aorus_lcd.py:37", "stated": "DESC = bytes([0x01, 0x00, 0x0B, 0xA9, 0x01, 0x00, 0x40, 0x01, 0xAA, 0x00, 0x01, 0x00])" },
+    "DESC_LEN": { "value": 12, "source": "aorus_lcd.py:38", "stated": "DESC_LEN = len(DESC)" },
+    "FB_STATIC": { "value": "0x01300000", "source": "aorus_lcd.py:41", "stated": "FB_STATIC = 0x01300000" },
+    "FB_GIF": { "value": "0x00000000", "source": "aorus_lcd.py:43", "stated": "FB_GIF    = 0x00000000" },
+    "MODE_STATIC": { "value": 3, "source": "aorus_lcd.py:44", "stated": "MODE_STATIC, MODE_TEXT, MODE_GIF = 3, 4, 5" },
+    "MODE_GIF": { "value": 5, "source": "aorus_lcd.py:44", "stated": "MODE_STATIC, MODE_TEXT, MODE_GIF = 3, 4, 5" },
+    "MAGIC": { "value": "cb 55 ac 38", "source": "aorus_lcd.py:48", "stated": "MAGIC = bytes([0xCB, 0x55, 0xAC, 0x38])" },
+    "PACE_BEGIN": { "value": 0.5, "source": "aorus_lcd.py:58", "stated": "PACE_BEGIN, PACE_HEADER, PACE_CHUNK = 0.5, 1.0, 0.01" },
+    "PACE_HEADER": { "value": 1.0, "source": "aorus_lcd.py:58", "stated": "PACE_BEGIN, PACE_HEADER, PACE_CHUNK = 0.5, 1.0, 0.01" },
+    "PACE_CHUNK": { "value": 0.01, "source": "aorus_lcd.py:58", "stated": "PACE_BEGIN, PACE_HEADER, PACE_CHUNK = 0.5, 1.0, 0.01" }
+  }
+}
