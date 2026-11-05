@@ -56,6 +56,8 @@ impl Globals {
 /// alphabetical, so that parallel branches touch different lines.
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Choose the sensor widgets the panel shows
+    Dashboard(commands::dashboard::Args),
     /// Check that the panel controller answers, and show its status
     Probe(commands::probe::Args),
 }
@@ -64,6 +66,7 @@ enum Command {
 /// `Command::Probe(args) => commands::probe::run(args, &cli.globals),`.
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Dashboard(args) => commands::dashboard::run(args, &cli.globals),
         Command::Probe(args) => commands::probe::run(args, &cli.globals),
     }
 }

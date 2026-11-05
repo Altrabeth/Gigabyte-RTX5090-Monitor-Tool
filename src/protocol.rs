@@ -174,6 +174,10 @@ impl TryFrom<u8> for Mode {
     }
 }
 
+/// The widgets shown when nothing else is asked for: the README's list, as
+/// [`parse_widgets`] takes it.
+pub const DEFAULT_WIDGETS: &str = "temp,clock,usage,fan,vram,power";
+
 /// A sensor widget of the dashboard. `docs/PROTOCOL.md` section 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -213,6 +217,61 @@ impl Element {
     pub const fn bit(self) -> u8 {
         self as u8
     }
+
+    /// The name of this widget on the command line and in the config file.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Element::GpuTemp => "temp",
+            Element::GpuClock => "clock",
+            Element::GpuUsage => "usage",
+            Element::FanSpeed => "fan",
+            Element::RamClock => "ramclock",
+            Element::RamUsage => "vram",
+            Element::Fps => "fps",
+            Element::Tgp => "power",
+        }
+    }
+
+    /// The widget called `name`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] naming `name` and listing the valid names.
+    pub fn from_name(name: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|element| element.name() == name)
+            .ok_or_else(|| {
+                let valid = Self::ALL.map(Self::name).join(", ");
+                Error::InvalidArgument(format!(
+                    "unknown widget {name:?}: valid widgets are {valid}"
+                ))
+            })
+    }
+}
+
+/// Parses a comma-separated widget list such as [`DEFAULT_WIDGETS`]. The order
+/// of the names does not matter, because the frame has a fixed place for each.
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] for an empty list, an unknown name or a name given
+/// twice.
+pub fn parse_widgets(list: &str) -> Result<Elements> {
+    if list.is_empty() {
+        return Err(Error::InvalidArgument("the widget list is empty".into()));
+    }
+    let mut elements = Elements::NONE;
+    for name in list.split(',') {
+        let element = Element::from_name(name)?;
+        if elements.contains(element) {
+            return Err(Error::InvalidArgument(format!(
+                "widget {name:?} is listed twice"
+            )));
+        }
+        elements = elements.with(element);
+    }
+    Ok(elements)
 }
 
 /// A set of dashboard elements. Every `u8` is a valid mask.

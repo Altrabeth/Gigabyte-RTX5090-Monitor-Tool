@@ -303,6 +303,53 @@ fn e1_all_and_none() {
 }
 
 #[test]
+fn widget_names_map_to_their_elements() {
+    let table = [
+        ("temp", Element::GpuTemp),
+        ("clock", Element::GpuClock),
+        ("usage", Element::GpuUsage),
+        ("fan", Element::FanSpeed),
+        ("ramclock", Element::RamClock),
+        ("vram", Element::RamUsage),
+        ("fps", Element::Fps),
+        ("power", Element::Tgp),
+    ];
+
+    for (name, element) in table {
+        assert_eq!(Element::from_name(name).unwrap(), element);
+        assert_eq!(element.name(), name);
+    }
+}
+
+#[test]
+fn an_unknown_widget_is_named_along_with_the_valid_ones() {
+    let message = parse_widgets("temp,gpu").unwrap_err().to_string();
+
+    assert_eq!(
+        message,
+        "unknown widget \"gpu\": valid widgets are \
+         temp, clock, usage, fan, ramclock, vram, fps, power"
+    );
+}
+
+#[test]
+fn a_widget_list_is_refused_when_empty_or_repeating() {
+    let empty = parse_widgets("").unwrap_err().to_string();
+    let twice = parse_widgets("temp,fan,temp").unwrap_err().to_string();
+
+    assert_eq!(empty, "the widget list is empty");
+    assert_eq!(twice, "widget \"temp\" is listed twice");
+    assert!(parse_widgets("temp,").is_err());
+    assert!(parse_widgets(",").is_err());
+}
+
+#[test]
+fn the_default_widgets_are_the_readme_list() {
+    // The bits of temp, clock, usage, fan, vram and power.
+    assert_eq!(parse_widgets(DEFAULT_WIDGETS).unwrap().bits(), 0xAF);
+}
+
+#[test]
 fn element_masks_compose() {
     let set: Elements = [Element::GpuTemp, Element::RamUsage, Element::Tgp]
         .into_iter()

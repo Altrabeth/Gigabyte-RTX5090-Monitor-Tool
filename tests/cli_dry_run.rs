@@ -1,4 +1,4 @@
-//! The real binary, in `--dry-run` only. This is the only test that starts it.
+//! The real binary, in `--dry-run` only, as in every test that starts it.
 //!
 //! As a second line of defence the child gets a lock path that cannot exist.
 //! The gate takes the lock before it opens a device, so if `--dry-run` ever
