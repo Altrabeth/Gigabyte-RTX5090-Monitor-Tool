@@ -1,0 +1,5 @@
+# Install as /usr/lib/sysusers.d/aorus-lcd.conf. The unit's SupplementaryGroups=
+# fails with status 216/GROUP without this group, and the tmpfiles entry and the
+# udev rule name it too. i2c-tools declares the same group, which does no harm:
+# sysusers leaves a group alone if it exists.
+g i2c - -

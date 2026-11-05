@@ -1,0 +1,10 @@
+post_install() {
+  cat <<'MSG'
+==> The aorus-lcd service is not enabled. To enable and start it:
+      sudo systemctl enable --now aorus-lcd
+==> For CLI use, join group i2c and log in again:
+      sudo usermod -aG i2c "$USER"
+==> i2c-dev loads at the next boot. To skip the reboot:
+      sudo modprobe i2c-dev
+MSG
+}

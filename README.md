@@ -246,6 +246,9 @@ sequence from `RECOVERY.md`.
 
 ## Setup on Arch
 
+A `PKGBUILD` is in [`dist/`](dist/) for building a package; it is not on the AUR yet.
+The steps below are the manual install.
+
 ```bash
 # load i2c-dev at boot
 echo i2c-dev | sudo tee /etc/modules-load.d/i2c-dev.conf
