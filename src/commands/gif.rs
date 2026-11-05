@@ -71,6 +71,9 @@ pub struct Args {
         value_parser = clap::value_parser!(u32).range(1..),
     )]
     pub frame_delay: Option<u32>,
+
+    #[arg(long, help = upload::NO_OVERLAY_HELP)]
+    pub no_overlay: bool,
 }
 
 /// A GIF, ready to send.
@@ -100,7 +103,11 @@ pub fn run(args: Args, globals: &crate::Globals) -> Result<()> {
         "{}",
         summary(gif.delays_ms.len(), gif.payload.len(), pauses)
     );
-    upload::send(&gif.payload, &params, false, globals)
+    let finish = upload::Finish {
+        clear_overlay: args.no_overlay,
+        persist: false,
+    };
+    upload::send(&gif.payload, &params, finish, globals)
 }
 
 fn prepare(path: &Path) -> Result<Prepared> {

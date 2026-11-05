@@ -14,6 +14,12 @@ use aorus_lcd::bus::lock::LOCK_PATH_ENV;
 const NOTICE: &str = "dry-run: a real run writes the panel configuration to NVRAM";
 /// The first row of `AA`, which has no parameters.
 const AA_ROW: &str = "AA CB 55 AC 38 00 00 00 00 00 00 00 00 00 00 00";
+/// The first row of `E1` with no widgets and interval 0, by hand from
+/// `docs/PROTOCOL.md` section 3: opcode, magic, flags `[5..12]`, interval `[13]`,
+/// padding.
+const CLEARED_E1_ROW: &str = "E1 CB 55 AC 38 00 00 00 00 00 00 00 00 00 00 00";
+const ZERO_ROW: &str = "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00";
+const E1: &str = "E1 SetDisplay (256 bytes)";
 
 fn dry_run(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_aorus-lcd"))
@@ -52,6 +58,14 @@ fn rows_after<'a>(dump: &'a str, header: &str, count: usize) -> Vec<&'a str> {
         .take(count)
         .map(|line| line.trim_start().split_once("  ").unwrap().1)
         .collect()
+}
+
+/// Exactly one `E1`, with every flag and the interval at zero.
+fn assert_one_cleared_e1(dump: &str) {
+    assert_eq!(dump.matches(E1).count(), 1, "{dump}");
+    let rows = rows_after(dump, "E1 ", 16);
+    assert_eq!(rows[0], CLEARED_E1_ROW);
+    assert!(rows[1..].iter().all(|row| *row == ZERO_ROW), "{dump}");
 }
 
 /// Refused with nothing on stdout, so before the probe and any bus access.
@@ -107,6 +121,40 @@ fn no_effect_leaves_aa_out_and_changes_nothing_else() {
     assert_eq!(frames.len(), 431);
     assert_eq!(frames[430], "E5 SetMode (256 bytes)");
     assert!(with_effect.starts_with(&plain));
+}
+
+#[test]
+fn text_leaves_the_overlay_alone_by_default() {
+    for options in [&[][..], &["--no-effect"]] {
+        let dump = dump_of(&[&["text", "hello"], options].concat());
+
+        assert!(!frame_sequence(&dump).contains(&E1), "{dump}");
+    }
+}
+
+#[test]
+fn no_overlay_clears_it_before_the_effect_saves() {
+    let dump = dump_of(&["text", "hello", "--no-overlay"]);
+
+    assert_one_cleared_e1(&dump);
+    let frames = frame_sequence(&dump);
+    assert_eq!(frames.len(), 433);
+    assert_eq!(
+        frames[430..],
+        ["E5 SetMode (256 bytes)", E1, "AA Save (256 bytes)"]
+    );
+}
+
+#[test]
+fn no_overlay_without_the_effect_ends_on_e1() {
+    let plain = dump_of(&["text", "hello", "--no-effect"]);
+    let dump = dump_of(&["text", "hello", "--no-effect", "--no-overlay"]);
+
+    assert_one_cleared_e1(&dump);
+    let frames = frame_sequence(&dump);
+    assert_eq!(frames.len(), 432);
+    assert_eq!(frames[430..], ["E5 SetMode (256 bytes)", E1]);
+    assert!(dump.starts_with(&plain));
 }
 
 #[test]

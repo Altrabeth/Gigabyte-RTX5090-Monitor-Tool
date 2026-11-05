@@ -189,9 +189,9 @@ Suggested crates: `clap`, `anyhow`/`thiserror`, `i2cdev` or `nix` (ioctls),
 aorus-lcd probe [--wait SECS]
 aorus-lcd on | off
 aorus-lcd mode <0-8>
-aorus-lcd image <file> [--save]
-aorus-lcd text "hello" [--color ff8800] [--bg 000000] [--size 32] [--no-effect]
-aorus-lcd gif <file> [--frame-delay MS]
+aorus-lcd image <file> [--save] [--no-overlay]
+aorus-lcd text "hello" [--color ff8800] [--bg 000000] [--size 32] [--no-effect] [--no-overlay]
+aorus-lcd gif <file> [--frame-delay MS] [--no-overlay]
 aorus-lcd carousel 0,1,4 --interval 5
 aorus-lcd dashboard --widgets temp,clock,usage,fan,vram,power --interval 3
 aorus-lcd daemon [--config /etc/aorus-lcd.toml] [--frame-bytes 256|128] [--feed steady|adaptive]
@@ -201,6 +201,10 @@ global: --bus N  --dry-run  -v
 
 `text` sends `AA` after the upload to start the rainbow effect, and that same frame saves
 the panel configuration to NVRAM. It prints a notice first; `--no-effect` leaves both out.
+
+An upload sends no `E1`, so a sensor overlay stays on top of the content, as in the reference.
+Keeping the sensors is the default and needs no flag. `--no-overlay` sends `E1` with no widgets
+after a successful upload, which clears the panel's selection until `dashboard` sets it again.
 
 ---
 
@@ -232,8 +236,9 @@ for hours.
 **M4 – Content uploads.** RGB565 conversion, image upload, RLE + GIF payload. Port the
 `selftest` vectors from `aorus_lcd.py` as Rust tests; output must be byte-identical.
 
-**M5 – Polish.** Text rendering, config file, PKGBUILD for the AUR, maybe a
-`--keep-sensors` option and the recovery sequence from `RECOVERY.md`.
+**M5 – Polish.** Text rendering, config file, PKGBUILD for the AUR, `--no-overlay`
+(keeping the sensors is the default, so there is no `--keep-sensors`) and the recovery
+sequence from `RECOVERY.md`.
 
 ---
 

@@ -32,6 +32,9 @@ pub struct Args {
     /// also saves the panel configuration to NVRAM, so this flag avoids that write
     #[arg(long)]
     pub no_effect: bool,
+
+    #[arg(long, help = upload::NO_OVERLAY_HELP)]
+    pub no_overlay: bool,
 }
 
 /// Renders the text, then uploads it. Rendering comes first because connecting
@@ -50,7 +53,10 @@ pub fn run(args: Args, globals: &crate::Globals) -> Result<()> {
     upload::send(
         &payload,
         &UploadParams::still(Framebuffer::Text),
-        !args.no_effect,
+        upload::Finish {
+            clear_overlay: args.no_overlay,
+            persist: !args.no_effect,
+        },
         globals,
     )
 }
@@ -81,6 +87,7 @@ mod tests {
         assert_eq!(args.color, [0x8B, 0x8D, 0x8B]);
         assert_eq!(args.bg, [0, 0, 0]);
         assert!(!args.no_effect);
+        assert!(!args.no_overlay);
     }
 
     #[test]
@@ -117,6 +124,15 @@ mod tests {
             assert!(help.contains("--no-effect"), "{help}");
             assert!(help.contains("NVRAM"), "{help}");
         }
+    }
+
+    // Rendered in-process so the test never has to run the binary.
+    #[test]
+    fn help_says_that_no_overlay_sends_e1() {
+        let help = Harness::command().render_help().to_string();
+
+        assert!(help.contains("--no-overlay"), "{help}");
+        assert!(help.contains("E1"), "{help}");
     }
 
     #[test]
