@@ -1,12 +1,19 @@
-//! `aorus-lcd carousel`: sets which modes the panel cycles through.
+//! `aorus-lcd carousel`: stores which modes the panel cycles through.
 
 use aorus_lcd::panel::Panel;
 use aorus_lcd::protocol::{carousel_frame, Mode};
 use aorus_lcd::session;
 use aorus_lcd::{Error, Result};
 
+/// Shown in `--help`. On the real panel `F3` left the mode as it was. Whether the
+/// carousel then plays after `mode 7` has not been checked, so this does not
+/// promise it.
+const NOTE: &str = "Note: F3 only stores this list and does not change the mode, so \
+                    `aorus-lcd mode 7` is needed to play it.";
+
 /// Arguments of `aorus-lcd carousel`.
 #[derive(Debug, clap::Args)]
+#[command(after_help = NOTE)]
 pub struct Args {
     /// Modes to cycle through in play order, such as 0,1,4; each one 0 to 6
     #[arg(value_name = "MODES", value_delimiter = ',', required = true)]

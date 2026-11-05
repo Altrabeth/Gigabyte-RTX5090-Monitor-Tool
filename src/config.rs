@@ -383,12 +383,12 @@ mod tests {
     fn the_command_line_beats_the_file_and_the_file_beats_the_defaults() {
         let temp = Some(Elements::NONE.with(Element::GpuTemp));
         let defaults = DaemonConfig::default();
-        let all = "widgets = \"temp\"\ninterval = 7\nfeed = \"adaptive\"\n\
+        let all = "widgets = \"temp\"\ninterval = 7\nfeed = \"steady\"\n\
                    frame_bytes = 128\nbus = 1\n";
         let every_option = Settings {
             widgets: Some(fps()),
             interval: Some(9),
-            feed: Some(FeedStrategy::Steady),
+            feed: Some(FeedStrategy::Adaptive),
             frame_bytes: Some(FeedFrameLen::Full),
             bus: Some(2),
         };
@@ -396,7 +396,7 @@ mod tests {
             elements: temp,
             interval_s: 7,
             feed: FeedFrameLen::Truncated,
-            strategy: FeedStrategy::Adaptive,
+            strategy: FeedStrategy::Steady,
             ..defaults
         };
         let from_options = DaemonConfig {
@@ -420,9 +420,9 @@ mod tests {
             ),
             (
                 Settings::default(),
-                "feed = \"adaptive\"\n",
+                "feed = \"steady\"\n",
                 DaemonConfig {
-                    strategy: FeedStrategy::Adaptive,
+                    strategy: FeedStrategy::Steady,
                     ..defaults
                 },
                 None,

@@ -58,7 +58,7 @@ impl Globals {
 enum Command {
     /// Choose the sensor widgets the panel shows
     Dashboard(commands::dashboard::Args),
-    /// Cycle through display modes
+    /// Store the list of display modes to cycle through
     Carousel(commands::carousel::Args),
     /// Keep the panel's sensor feed running
     Daemon(commands::daemon::Args),

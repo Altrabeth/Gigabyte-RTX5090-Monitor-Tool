@@ -28,6 +28,14 @@ fn dry_run(config: Option<&Path>, arguments: &[&str]) -> Output {
     command.output().unwrap()
 }
 
+/// A [`dry_run`] on the steady feed, for tests that need the first `E3`: it reads
+/// the real sensors, and on a busy GPU the default feed sends nothing on its first
+/// ticks. The option beats any `feed` in the file, so a test using this says
+/// nothing about that key.
+fn steady_dry_run(config: Option<&Path>, arguments: &[&str]) -> Output {
+    dry_run(config, &[&["--feed", "steady"], arguments].concat())
+}
+
 fn config_file(text: &[u8]) -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aorus-lcd.toml");
@@ -38,6 +46,11 @@ fn config_file(text: &[u8]) -> (TempDir, PathBuf) {
 fn with_config(text: &str, arguments: &[&str]) -> Output {
     let (_dir, path) = config_file(text.as_bytes());
     dry_run(Some(&path), arguments)
+}
+
+fn steady_with_config(text: &str, arguments: &[&str]) -> Output {
+    let (_dir, path) = config_file(text.as_bytes());
+    steady_dry_run(Some(&path), arguments)
 }
 
 fn stdout(output: &Output) -> String {
@@ -95,30 +108,39 @@ fn the_file_can_choose_the_adaptive_feed() {
 fn the_command_line_beats_the_file() {
     let text = "widgets = \"temp\"\ninterval = 7\n";
 
-    let output = with_config(text, &["--widgets", "fps", "--interval", "9"]);
+    let output = steady_with_config(text, &["--widgets", "fps", "--interval", "9"]);
 
     assert!(output.status.success(), "{output:?}");
-    let expected = with_config("widgets = \"fps\"\ninterval = 9\n", &[]);
+    let expected = steady_with_config("widgets = \"fps\"\ninterval = 9\n", &[]);
     assert_eq!(setup_frames(&output), setup_frames(&expected));
-    assert_ne!(setup_frames(&output), setup_frames(&with_config(text, &[])));
+    assert_ne!(
+        setup_frames(&output),
+        setup_frames(&steady_with_config(text, &[]))
+    );
 }
 
 #[test]
 fn an_empty_file_is_the_same_as_no_options() {
-    let output = with_config("# nothing\n", &[]);
+    let output = steady_with_config("# nothing\n", &[]);
 
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(setup_frames(&output), setup_frames(&dry_run(None, &[])));
+    assert_eq!(
+        setup_frames(&output),
+        setup_frames(&steady_dry_run(None, &[]))
+    );
 }
 
 #[test]
 fn the_shipped_example_is_the_same_as_no_options() {
     let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("dist/aorus-lcd.toml");
 
-    let output = dry_run(Some(&example), &[]);
+    let output = steady_dry_run(Some(&example), &[]);
 
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(setup_frames(&output), setup_frames(&dry_run(None, &[])));
+    assert_eq!(
+        setup_frames(&output),
+        setup_frames(&steady_dry_run(None, &[]))
+    );
 }
 
 #[test]

@@ -32,12 +32,17 @@ pub struct Args {
     )]
     pub interval: Option<u8>,
 
-    /// Bytes per E3 frame: 256, the known-good spec, or 128, untested on a 5090
+    /// Bytes per E3 frame: 256, the default, or 128, which is unreliable on this
+    /// card. An RTX 5090 refused 21 of 163 writes at 128 bytes against 1 of 162 at
+    /// 256, and status polls failed during the feed
     #[arg(long, value_name = "256|128", value_parser = parse_frame_bytes)]
     pub frame_bytes: Option<FeedFrameLen>,
 
-    /// steady sends every second. adaptive does too under 50% GPU usage, and from
-    /// there up sends a 5-second summary, twice, every 6 seconds
+    /// How often E3 goes out. adaptive, the default, sends a frame every second
+    /// under 50% GPU usage, and from there up a pair of frames about every 6 s,
+    /// carrying the peaks and averages of the last 5 s. steady sends a frame every
+    /// second at any load. On an RTX 5090 each E3 stalled other NVIDIA driver calls
+    /// by up to 35 ms, which is a proxy for the cost, not a measured frame drop
     #[arg(long, value_name = "steady|adaptive")]
     pub feed: Option<FeedStrategy>,
 
@@ -113,6 +118,14 @@ mod tests {
     }
 
     #[test]
+    fn without_options_the_feed_is_adaptive_at_256_bytes() {
+        let config = config_parsed_from(&[]);
+
+        assert_eq!(config.strategy, FeedStrategy::Adaptive);
+        assert_eq!(config.feed, FeedFrameLen::Full);
+    }
+
+    #[test]
     fn the_frame_length_and_strategy_reach_the_config() {
         let config = config_parsed_from(&["--frame-bytes", "128", "--feed", "adaptive"]);
         assert_eq!(config.feed, FeedFrameLen::Truncated);
@@ -177,5 +190,24 @@ mod tests {
         assert_eq!(harness.args.max_ticks, Some(7));
         let help = Harness::command().render_help().to_string();
         assert!(!help.contains("--max-ticks"), "{help}");
+    }
+
+    #[test]
+    fn the_help_describes_the_default_feed_and_warns_about_128_bytes() {
+        let help = Harness::command().render_help().to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        for expected in [
+            "adaptive, the default",
+            "under 50% GPU usage",
+            "a pair of frames about every 6 s",
+            "peaks and averages",
+            "not a measured frame drop",
+            "unreliable on this card",
+            "21 of 163 writes at 128 bytes against 1 of 162",
+            "status polls failed during the feed",
+        ] {
+            assert!(help.contains(expected), "{expected}: {help}");
+        }
     }
 }

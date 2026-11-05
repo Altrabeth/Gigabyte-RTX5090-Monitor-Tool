@@ -350,7 +350,8 @@ pub enum FeedFrameLen {
     /// 256 bytes, the known-good spec.
     #[default]
     Full,
-    /// 128 bytes, which costs less frame time.
+    /// 128 bytes, less time on the bus but unreliable on an RTX 5090: see the
+    /// [daemon's module docs](crate::daemon#why-the-feed-defaults-to-adaptive).
     Truncated,
 }
 

@@ -130,15 +130,22 @@ rotation of the built-in screens plus stored user content. `F3` carousels accept
 ### Sensor dashboard
 - `E1` selects which widgets show (GPU temp, GPU clock, GPU usage, fan, RAM clock,
   RAM usage, FPS, TGP) and the rotation interval; the firmware rotates them itself.
-- `E3` carries the live values. If it is not pushed at a steady ~1 Hz keep-alive the
-  widgets freeze or go blank. This is the daemon's job.
+- `E3` carries the live values. If it is not pushed regularly the widgets freeze or go
+  blank. This is the daemon's job.
 - NVML has no FPS source: send 0.
 - `nvmlDeviceGetPowerUsage` reports a stuck value on RTX 50 cards; read the instant power
   field first and fall back to it.
 - The periodic I2C write can cost frame time. Upstream measured 1% lows of about 141 fps
   with a 256-byte 1 Hz feed against about 182 with almost no writes (RTX 5080, Windows,
-  unverified here). 128-byte `E3` frames (`--frame-bytes 128`) and an adaptive feed
-  (`--feed adaptive`) reduce this. Both stay off by default until measured on this card.
+  unverified here). On this card a 1 Hz feed stalled other NVIDIA driver calls once per
+  second, for up to 35 ms. That is a proxy, measured with `nvmlDeviceGetMemoryInfo`
+  latency, not a measured game frame drop.
+- The daemon defaults to the adaptive feed: a frame every second below 50% GPU usage, and
+  from there up a pair of frames about every 6 s, carrying peaks and averages. The widgets
+  stay visible under load. `--feed steady` sends every second at any load.
+- `--frame-bytes 128` is unreliable on this card: 21 of 163 writes were refused against
+  1 of 162 at 256 bytes, and 5 of 12 `status` polls failed during the feed. 256 stays the
+  default.
 
 ---
 
