@@ -27,9 +27,9 @@ pub fn run(args: Args, globals: &crate::Globals) -> Result<()> {
     Panel::new(session::connect(&globals.options())?).set_carousel(args.interval, &modes)
 }
 
-/// Mode 7 passes here, for [`carousel_frame`] to refuse along with the other
-/// list rules. Only the wording is this command's: `Mode`'s own error would
-/// offer a 7 that the next check turns down.
+/// Modes 7 and 8 pass here, for [`carousel_frame`] to refuse along with the
+/// other list rules. Only the wording is this command's: `Mode`'s own error
+/// would offer a 7 and an 8 that the next check turns down.
 fn parse_modes(numbers: &[u8]) -> Result<Vec<Mode>> {
     numbers
         .iter()
@@ -83,9 +83,9 @@ mod tests {
 
     #[test]
     fn a_number_that_is_no_mode_is_refused_in_carousel_terms() {
-        let error = parse_modes(&[0, 8]).unwrap_err();
+        let error = parse_modes(&[0, 9]).unwrap_err();
 
         assert!(matches!(error, Error::InvalidArgument(_)), "{error:?}");
-        assert_eq!(error.to_string(), "carousel modes must be 0 to 6, not 8");
+        assert_eq!(error.to_string(), "carousel modes must be 0 to 6, not 9");
     }
 }

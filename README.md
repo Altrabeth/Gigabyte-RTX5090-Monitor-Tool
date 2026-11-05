@@ -95,8 +95,11 @@ DDC ports falsely ACK it). The controller can need up to a minute after boot to 
 | `D6`, `DE`, `DF`, `F4` | Get FW / mode / display / loop | read-backs |
 
 Display modes: `0-2` built-in stat screens, `3` image, `4` text, `5` gif, `6` chibi,
-`7` carousel (GCC quirk: the wire byte is `0x0A`, internal mode 9 + 1). `F3` carousels
-accept modes `0-6` only.
+`7` carousel (GCC quirk: the wire byte is `0x0A`, internal mode 9 + 1), `8` preset
+rotation (wire byte `0x0B`; the number is only this tool's label). The real 5090 reported
+this raw mode at rest. Its behaviour is known only from upstream notes on an RTX 5080: a
+rotation of the built-in screens plus stored user content. `F3` carousels accept modes
+`0-6` only.
 
 ### Panel and uploads
 - 320x170 pixels, RGB565 little-endian, row-major.
@@ -178,7 +181,7 @@ Suggested crates: `clap`, `anyhow`/`thiserror`, `i2cdev` or `nix` (ioctls),
 ```
 aorus-lcd probe [--wait SECS]
 aorus-lcd on | off
-aorus-lcd mode <0-7>
+aorus-lcd mode <0-8>
 aorus-lcd image <file> [--save]
 aorus-lcd text "hello" [--color ff8800] [--bg 000000] [--size 32] [--no-effect]
 aorus-lcd gif <file> [--frame-delay MS]

@@ -8,8 +8,8 @@ use aorus_lcd::Result;
 /// Arguments of `aorus-lcd mode`.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// 0-2 stat screens, 3 image, 4 text, 5 GIF, 6 chibi clock, 7 carousel
-    #[arg(value_name = "0-7")]
+    /// 0-2 stat screens, 3 image, 4 text, 5 GIF, 6 chibi clock, 7 carousel, 8 preset rotation
+    #[arg(value_name = "0-8")]
     pub mode: u8,
 }
 
