@@ -3,329 +3,344 @@
 A small Rust tool and daemon that drives the **LCD Edge View** side screen of the
 **Gigabyte AORUS GeForce RTX 5090 MASTER** on Linux (Arch), with no Gigabyte software.
 
-> Status: planning / not yet implemented. This README is the spec.
+On Linux the panel otherwise just loops a built-in animation. With this tool it can:
 
----
+- **Show live GPU stats** (temperature, clocks, usage, fan, VRAM, power), fed by a background
+  daemon that starts at boot.
+- **Show your own content**: image, text or animated GIF.
+- **Control the panel**: on and off, built-in screens, carousel list, saving to its NVRAM.
+- **Repair a frozen or dark panel** with `aorus-lcd recover`.
 
-## Goal
-
-On Windows, Gigabyte Control Center (GCC) can show live GPU stats, images, text and GIFs
-on the card's 320x170 side panel. On Linux the panel just loops a built-in animation.
-
-This project should:
-
-1. **Show live GPU stats** (temperature, clocks, usage, fan, VRAM, power) on the panel,
-   fed by a lightweight background daemon that starts at boot.
-2. **Upload content**: static image, text, animated GIF, choose built-in screens,
-   carousel, save to panel NVRAM.
-3. Ship as **one static-ish Rust binary** plus a **systemd unit**, later packaged for the AUR.
-
-Out of scope: fan curves, overclocking, BIOS/firmware flashing, RGB lighting (maybe later).
-
----
-
-## Hardware
-
-- Card: Gigabyte AORUS GeForce RTX 5090 MASTER 32G (`GV-N5090AORUS M-32GD`).
-  Verify with the sticker on the card, or:
-  ```bash
-  lspci -nnk -d 10de: | grep -A2 VGA          # Subsystem: Gigabyte [1458:416e]
-  nvidia-smi -q | grep -iE "product name|vbios"
-  ```
-  The subsystem ID `1458:416e` is the reliable identifier; `Board Part Number` can read `N/A`.
-- The panel hangs off the GPU's internal I2C bus, exposed by the proprietary NVIDIA
-  driver as a Linux I2C adapter named `NVIDIA i2c adapter 1 at ...`.
-- Other Gigabyte LCD cards may use a newer protocol ("LcdEx", address `0x76`).
-  **This project only supports the legacy `0x61` protocol.** If the probe fails, stop.
-
----
-
-## Prior art (read these first)
-
-| Project | What it is | What we take from it |
-|---|---|---|
-| [albancreton/aorus-master-linux](https://github.com/albancreton/aorus-master-linux) | Python script (`aorus_lcd.py`, `smbus2` + `Pillow`) that already controls the panel on Linux: probe, on/off, mode, image, text, gif, carousel. Alpha, tested on one RTX 5090 Master. MIT. | **Reference implementation.** Bus discovery, frame format, upload sequence, RLE encoder, selftest vectors. Our Rust output must be byte-identical. |
-| [CodeTorchAI/AorusLcd](https://github.com/CodeTorchAI/AorusLcd) | C#/Avalonia port for Windows (NVAPI). Adds the live sensor dashboard and a background feed service. MIT. | **[`docs/PROTOCOL.md`](https://github.com/CodeTorchAI/AorusLcd/blob/main/docs/PROTOCOL.md)**: complete opcode reference incl. `E1` (dashboard config) and `E3` (sensor feed) byte layouts. Also `docs/RECOVERY.md` for unsticking a frozen panel. |
-| [OpenRGB](https://github.com/CalcProgrammer1/OpenRGB) | RGB control | Only relevant if we ever add RGB. Not now. |
-
-**What is missing on Linux today:** the Python tool cannot drive the live stats dashboard
-(nothing pushes the `E3` sensor feed), has no daemon/systemd integration, and runs from a
-venv that breaks on Arch Python version bumps. That gap is this project.
-
----
-
-## Protocol summary
-
-Facts collected from the two projects above. **`PROTOCOL.md` and `aorus_lcd.py` are
-authoritative; check byte layouts there, do not guess.**
-
-### Bus
-- Load `i2c-dev`; find the adapter whose sysfs name starts with `NVIDIA i2c adapter 1`
-  (`/sys/class/i2c-dev/i2c-N/name`). Never pick a `/dev/i2c-N` by number heuristics.
-  Allow a `--bus N` override, but it must still name an NVIDIA adapter.
-- LCD controller address: **`0x61`**. This is the only address we ever write to.
-- `0x71` / `0x75` is the RGB controller on the same bus (`0x75` on this card). **Never
-  touch it.** It is write-only; reads to it can wedge the GPU's I2C engine.
-- Frames are 256 bytes, larger than the SMBus 32-byte block limit, so use **raw I2C
-  transfers** (`I2C_RDWR` ioctl, or `I2C_SLAVE` + `write(2)`). Mirror what `aorus_lcd.py`
-  does with `smbus2`.
-
-### Frame format
-Every command is one 256-byte write:
-```
-[opcode, 0xCB, 0x55, 0xAC, 0x38, params..., 0x00 padding up to 256]
-```
-
-### Presence probe
-Send the status query `EB 03` and **require a valid read-back** before any other write.
-Do not use a zero-length "quick write" probe (the NVIDIA adapter rejects it and unconnected
-DDC ports falsely ACK it). The controller can need up to a minute after boot to answer.
-
-### Opcodes
-| Opcode | Command | Notes |
-|---|---|---|
-| `E7` | OpenLcd | panel on / off |
-| `E5` | SetMode | display mode (see below) |
-| `E1` | SetDisplay | dashboard overlay: sensor-element bitmask + rotation interval. Send at most once on (re)connect, only if `DF` shows the panel needs it, never periodically; it is the prime suspect in dark-panel incidents (see `RECOVERY.md`). |
-| `E3` | Sensor feed | live GPU values, must be pushed about once per second |
-| `EA` / `EB 03` | Set / Get image template | `EB 03` doubles as presence probe |
-| `F3` | SetLoop | carousel |
-| `F2` / `F1` | Upload begin/end, header | content uploads |
-| `AA` | Save | persist current config to panel NVRAM; the same frame triggers the text rainbow effect, so applying that effect also saves. Never send it from the daemon. |
-| `D6`, `DE`, `DF`, `F4` | Get FW / mode / display / loop | read-backs |
-
-Display modes: `0-2` built-in stat screens, `3` image, `4` text, `5` gif, `6` chibi,
-`7` carousel (GCC quirk: the wire byte is `0x0A`, internal mode 9 + 1), `8` preset
-rotation (wire byte `0x0B`; the number is only this tool's label). The real 5090 reported
-this raw mode at rest. Its behaviour is known only from upstream notes on an RTX 5080: a
-rotation of the built-in screens plus stored user content. `F3` carousels accept modes
-`0-6` only.
-
-### Panel and uploads
-- 320x170 pixels, RGB565 little-endian, row-major.
-- Upload sequence: `F2` BEGIN, `F1` header, payload in 256-byte zero-padded chunks,
-  `F2` END, then `E5` SetMode. Chunk count is `len / 256 + 1`, so an exact multiple of
-  256 still gets one full padding chunk.
-- Image and text payloads are the 12-byte descriptor `01 00 0B A9 01 00 40 01 AA 00 01 00`
-  followed by the pixels.
-- Pacing is set by the firmware: about 0.5 s after BEGIN, 1.0 s after the header,
-  about 10 ms per chunk.
-- Framebuffer targets in the `F1` header: image `0x01300000`, text `0x01320000`,
-  gif `0x00000000` (live buffer).
-- **Order matters:** for GIFs send `SetMode 5` *before* streaming; for image/text send
-  SetMode *after* the upload.
-- GIF payload: `u16 LE frame count`, then per frame a 10-byte entry
-  (`u32 LE` **inclusive** end offset `2 + 10*N + sum(sizes) - 1`, `u16 width`, `u16 height`,
-  `u16 format` where `3` = RLE), then the concatenated RLE frames.
-- The panel skips the first frame of a GIF: seen on firmware 1.3 of the RTX 5090 Master, by
-  position and regardless of content. `aorus-lcd gif` therefore sends the first frame twice,
-  so the frame count it sends is one more than the GIF has, and a GIF can have at most 255
-  frames. This is a workaround for observed behaviour, not documented protocol.
-- RLE tokens: 2-byte LE head, bit 15 = run flag, low 15 bits = pixel count.
-  Run (only for 3+ identical pixels): head + one pixel. Literal: head + that many pixels.
-  Encoding works in windows of at most `0x7FFF` pixels. A window with no repeat, or with
-  fewer than 4 pixels left, is one literal even if its pixels are equal. Reproduce these
-  quirks exactly; the firmware decoder mirrors the encoder.
-
-### Sensor dashboard
-- `E1` selects which widgets show (GPU temp, GPU clock, GPU usage, fan, RAM clock,
-  RAM usage, FPS, TGP) and the rotation interval; the firmware rotates them itself.
-- `E3` carries the live values. If it is not pushed regularly the widgets freeze or go
-  blank. This is the daemon's job.
-- NVML has no FPS source: send 0.
-- `nvmlDeviceGetPowerUsage` reports a stuck value on RTX 50 cards; read the instant power
-  field first and fall back to it.
-- The periodic I2C write can cost frame time. Upstream measured 1% lows of about 141 fps
-  with a 256-byte 1 Hz feed against about 182 with almost no writes (RTX 5080, Windows,
-  unverified here). On this card a 1 Hz feed stalled other NVIDIA driver calls once per
-  second, for up to 35 ms. That is a proxy, measured with `nvmlDeviceGetMemoryInfo`
-  latency, not a measured game frame drop.
-- The daemon defaults to the adaptive feed: a frame every second below 50% GPU usage, and
-  from there up a pair of frames about every 6 s, carrying peaks and averages. The widgets
-  stay visible under load. `--feed steady` sends every second at any load.
-- `--frame-bytes 128` is unreliable on this card: 21 of 163 writes were refused against
-  1 of 162 at 256 bytes, and 5 of 12 `status` polls failed during the feed. 256 stays the
-  default.
-
----
-
-## Architecture
-
-```
-aorus-lcd-rs/
-├── Cargo.toml
-├── src/
-│   ├── lib.rs         # library root, so tests/ can reach the modules
-│   ├── main.rs        # clap CLI, subcommand dispatch
-│   ├── bus/           # discovery.rs, transport.rs (raw I2C), lock.rs (flock)
-│   ├── protocol.rs    # pure frame builders (no I/O), opcodes, enums
-│   ├── panel.rs       # high-level ops: probe, on/off, mode, upload, save
-│   ├── image.rs       # resize to 320x170, RGB565 conversion
-│   ├── text.rs        # text render in the embedded font
-│   ├── rle.rs         # RLE encoder + GIF payload builder
-│   ├── sensors.rs     # NVML polling -> E3 values
-│   ├── session.rs     # the write gate: adapter, lock, device, EB 03 probe
-│   ├── config.rs      # the daemon's config file, merged with the CLI
-│   └── daemon.rs      # 1 Hz loop, signal handling, reconnect
-├── assets/            # the embedded font and its licence
-├── tests/             # byte-parity tests against vectors from aorus_lcd.py
-└── dist/
-    ├── aorus-lcd.service
-    ├── aorus-lcd.toml       # commented example config
-    ├── aorus-lcd.tmpfiles   # creates the bus lock file
-    ├── i2c-dev.conf
-    ├── 99-i2c.rules
-    └── PKGBUILD       # later
-```
-
-Design rules:
-- `protocol.rs` and `rle.rs` are **pure functions** that return byte buffers, so they can
-  be unit-tested without hardware.
-- Every command supports `--dry-run`: hex-dump frames instead of writing.
-- All bus access goes through one exclusive file lock (`/run/aorus-lcd.lock`) so the
-  daemon and an image upload never interleave on the bus. Non-root users cannot create
-  that file, so `dist/aorus-lcd.tmpfiles` does. Never fall back silently to another path;
-  that would break mutual exclusion.
-- Refuse to write if the `EB 03` probe fails. Never write to any address except `0x61`.
-
-Suggested crates: `clap`, `anyhow`/`thiserror`, `i2cdev` or `nix` (ioctls),
-`nvml-wrapper` (loads `libnvidia-ml.so` from `nvidia-utils`), `image`, `gif`,
-`fontdue` (text), `signal-hook`, `fs4` or `rustix` (flock), `toml`/`serde`
-(config).
-
-### CLI sketch
-```
-aorus-lcd probe [--wait SECS]
-aorus-lcd on | off
-aorus-lcd mode <0-8>
-aorus-lcd image <file> [--save] [--no-overlay]
-aorus-lcd text "hello" [--color ff8800] [--bg 000000] [--size 32] [--no-effect] [--no-overlay]
-aorus-lcd gif <file> [--frame-delay MS] [--no-overlay]
-aorus-lcd carousel 0,1,4 --interval 5
-aorus-lcd dashboard --widgets temp,clock,usage,fan,vram,power --interval 3
-aorus-lcd daemon [--config /etc/aorus-lcd.toml] [--widgets LIST] [--interval SECS] [--frame-bytes 256|128] [--feed steady|adaptive]
-aorus-lcd save
-global: --bus N  --dry-run  -v
-```
-
-`text` sends `AA` after the upload to start the rainbow effect, and that same frame saves
-the panel configuration to NVRAM. It prints a notice first; `--no-effect` leaves both out.
-
-An upload sends no `E1`, so a sensor overlay stays on top of the content, as in the reference.
-Keeping the sensors is the default and needs no flag. `--no-overlay` sends `E1` with no widgets
-after a successful upload, which clears the panel's selection until `dashboard` sets it again.
-
----
-
-## Milestones
-
-**M0 – Verify hardware.** Confirm the subsystem ID and adapter name, then run a real
-`EB 03` probe. Note the bus number and that `probe` succeeds. If it fails, stop here.
-The reference tool can do this before any code exists:
-```bash
-sudo modprobe i2c-dev
-git clone https://github.com/albancreton/aorus-master-linux /tmp/ref && cd /tmp/ref
-python -m venv .venv && .venv/bin/pip install smbus2 Pillow
-sudo .venv/bin/python aorus_lcd.py probe
-sudo .venv/bin/python aorus_lcd.py selftest
-```
-This project uses its own `aorus-lcd probe` for the gate instead, which sends the same frame.
-
-**M1 – Bus + probe.** Adapter discovery by name, raw I2C transfer, `EB 03` probe,
-`probe` subcommand, lock file, `--dry-run`.
-
-**M2 – Basic commands.** `on`, `off`, `mode`, `save`, `carousel`. Frame builders with
-unit tests that compare bytes to what `aorus_lcd.py` produces.
-
-**M3 – Sensor daemon (main goal).** Read the `E1`/`E3` layouts from `PROTOCOL.md`,
-implement `dashboard` and `daemon`: NVML poll at 1 Hz, push `E3`, reconnect on bus errors,
-clean shutdown on SIGTERM. Add `dist/aorus-lcd.service`. Verify the widgets keep updating
-for hours.
-
-**M4 – Content uploads.** RGB565 conversion, image upload, RLE + GIF payload. Port the
-`selftest` vectors from `aorus_lcd.py` as Rust tests; output must be byte-identical.
-
-**M5 – Polish.** Text rendering, config file, PKGBUILD for the AUR, `--no-overlay`
-(keeping the sensors is the default, so there is no `--keep-sensors`) and the recovery
-sequence from `RECOVERY.md`.
-
----
+It has been tested on one card, and parts of it have never run on real hardware: see
+[Status](#status). Fan curves, overclocking, firmware flashing and RGB lighting are out of scope.
 
 ## Setup on Arch
 
-A `PKGBUILD` is in [`dist/`](dist/) for building a package; it is not on the AUR yet.
-The steps below are the manual install.
+You need the proprietary NVIDIA driver (`nvidia` or `nvidia-open`, plus `nvidia-utils`) and this
+exact card. `aorus-lcd` does not check the card's identity, so check it yourself first:
 
 ```bash
-# load i2c-dev at boot
-echo i2c-dev | sudo tee /etc/modules-load.d/i2c-dev.conf
-sudo modprobe i2c-dev
-
-# allow non-root access to I2C (create group if it does not exist)
-sudo groupadd -f i2c
-echo 'KERNEL=="i2c-[0-9]*", GROUP="i2c", MODE="0660"' | sudo tee /etc/udev/rules.d/99-i2c.rules
-sudo udevadm control --reload && sudo udevadm trigger
-sudo usermod -aG i2c "$USER"   # re-login afterwards
-
-# create the bus lock file, which non-root users cannot
-sudo install -Dm644 dist/aorus-lcd.tmpfiles /etc/tmpfiles.d/aorus-lcd.conf
-sudo systemd-tmpfiles --create /etc/tmpfiles.d/aorus-lcd.conf
-
-# build
-cargo build --release
-./target/release/aorus-lcd probe
+lspci -nnk -d 10de: | grep -A2 VGA          # Subsystem: Gigabyte [1458:416e]
 ```
 
-Requires the proprietary NVIDIA driver (`nvidia` / `nvidia-open` + `nvidia-utils`).
+The subsystem ID is the reliable identifier: `Board Part Number` in `nvidia-smi -q` can read `N/A`.
+Other Gigabyte LCD cards may use a newer protocol at address `0x76`, which this tool does not
+support. If `aorus-lcd probe` fails on your card after the wait below, stop there.
 
-### Daemon
-The service runs as an unprivileged dynamic user in group `i2c`, so it needs that group
-from Setup and the lock file from the tmpfiles entry. The `dist/` files match what Setup
-wrote, so installing them again changes nothing.
+### Manual install
+
 ```bash
-sudo install -Dm755 target/release/aorus-lcd /usr/local/bin/aorus-lcd
-sudo install -Dm644 dist/aorus-lcd.service /etc/systemd/system/aorus-lcd.service
-sudo install -Dm644 dist/aorus-lcd.tmpfiles /etc/tmpfiles.d/aorus-lcd.conf
+sudo pacman -S --needed base-devel rust
+git clone https://github.com/Altrabeth/Gigabyte-RTX5090-Monitor-Tool
+cd Gigabyte-RTX5090-Monitor-Tool
+cargo build --release --locked
+
+# I2C access, and the bus lock file, which non-root users cannot create
+sudo groupadd -f i2c
 sudo install -Dm644 dist/i2c-dev.conf /etc/modules-load.d/i2c-dev.conf
 sudo install -Dm644 dist/99-i2c.rules /etc/udev/rules.d/99-i2c.rules
+sudo install -Dm644 dist/aorus-lcd.tmpfiles /etc/tmpfiles.d/aorus-lcd.conf
+sudo modprobe i2c-dev
+sudo udevadm control --reload && sudo udevadm trigger
 sudo systemd-tmpfiles --create /etc/tmpfiles.d/aorus-lcd.conf
+sudo usermod -aG i2c "$USER"
+```
+
+Log out and back in so the group applies, then install the binary and the daemon:
+
+```bash
+sudo install -Dm755 target/release/aorus-lcd /usr/local/bin/aorus-lcd
+aorus-lcd probe --wait 60
+sudo install -Dm644 dist/aorus-lcd.service /etc/systemd/system/aorus-lcd.service
 sudo systemctl enable --now aorus-lcd
 ```
 
-The daemon reads `/etc/aorus-lcd.toml` once at start, if it exists; `--config PATH` reads
-another file instead. Options on the command line beat the file, and the file beats the
-defaults. An unknown key, a bad value or a file that exists but cannot be read stops the
-daemon before it touches the bus. The example changes nothing until a setting in it is
-uncommented:
+The service runs as an unprivileged dynamic user in group `i2c`. Optionally, install the example
+config, which changes nothing until a setting in it is uncommented:
+
 ```bash
 sudo install -Dm644 dist/aorus-lcd.toml /etc/aorus-lcd.toml
 ```
 
----
+### Boot into the stat screen
+
+The daemon does not set the display mode, so after a cold boot the panel shows what is saved in its
+NVRAM, which may not be a screen with widgets. Run this once. `save` writes the panel's NVRAM:
+
+```bash
+aorus-lcd mode 0
+aorus-lcd save
+```
+
+Whether a save survives a cold power-off has not been verified.
+
+### Package
+
+[`dist/PKGBUILD`](dist/PKGBUILD) builds a package from the `v0.1.0` tag, but that tag does not exist
+yet and nothing is on the AUR, so the manual install is the only route for now. The PKGBUILD has
+never been installed.
+
+If you later move from the manual install to the package, clear these first:
+
+- An existing `/etc/aorus-lcd.toml` makes pacman stop with a file conflict. Move it aside and put it
+  back after installing.
+- `/etc/systemd/system/aorus-lcd.service` shadows the packaged unit and still points at
+  `/usr/local/bin`. Remove it and the binary:
+
+```bash
+sudo systemctl disable --now aorus-lcd
+sudo rm /etc/systemd/system/aorus-lcd.service /usr/local/bin/aorus-lcd
+sudo systemctl daemon-reload
+```
+
+## Status
+
+The project is still being verified. Everything below was established on one RTX 5090 Master:
+firmware 1.3, driver 615.78.08, subsystem `1458:416e`, kernel 6.18.
+
+**Confirmed by eye on the panel:**
+
+- Image upload shows correctly.
+- GIFs play all frames, with the first frame sent twice.
+- `E3` layout: fixed test values showed exactly on all 8 widgets.
+- Adaptive feed under load: widgets stay visible and update about every 6 s.
+
+**Confirmed by read-back only**, so the panel's answers were right but nobody checked the screen:
+
+- `probe`, `status`, `on`, `off`
+- `mode` 0, 1, 7 and 8
+- `carousel` storing its list
+- `recover` with default options
+- `save`
+
+**Not verified:**
+
+- `text` on the real panel, including the rainbow effect.
+- Whether the carousel actually plays after `mode 7`, and the unit of its interval.
+- `recover` on an actually dark panel, or with `--overlay` or `--clear-overlay`.
+- `E1` was never sent to the real panel. The daemon has not needed it, because the panel already
+  held a widget config. So `dashboard`, `--no-overlay`, and any other path that sends `E1` are
+  untested on hardware.
+- Whether `AA`, the save frame, survives a cold power-off.
+- The systemd unit and the PKGBUILD have never been installed, because no root was available.
+- Frame-rate effect in real games. The 35 ms driver stall under [Feed cost](#feed-cost) is a proxy.
+- Suspend and resume.
+
+<!-- Placeholder for the soak result. -->
+Soak test: pending.
+
+**Open issue:** once the panel reported mode 5 (GIF) after feed tests without any `E5` being sent,
+and three later attempts did not reproduce it. It is unexplained. If it happens, run
+`aorus-lcd mode 0`.
+
+## Commands
+
+```
+aorus-lcd probe [--wait SECS]
+aorus-lcd status
+aorus-lcd on
+aorus-lcd off
+aorus-lcd mode <0-8>
+aorus-lcd image <FILE> [--save] [--no-overlay]
+aorus-lcd text <TEXT> [--color RRGGBB] [--bg RRGGBB] [--size PIXELS] [--no-effect] [--no-overlay]
+aorus-lcd gif <FILE> [--frame-delay MS] [--no-overlay]
+aorus-lcd carousel <MODES> [--interval INTERVAL]
+aorus-lcd dashboard [--widgets LIST] [--interval SECS] [--off]
+aorus-lcd daemon [--config PATH] [--widgets LIST] [--interval SECS]
+                 [--frame-bytes 256|128] [--feed steady|adaptive]
+aorus-lcd recover [--mode 0-8] [--color RRGGBB] [--no-powercycle] [--no-upload]
+                  [--overlay | --clear-overlay] [--save]
+aorus-lcd save
+```
+
+Every command also takes `--bus N`, which replaces autodetection and must still name an NVIDIA
+adapter, `--dry-run`, which prints the frames and touches no bus, and `-v`, repeatable. Use
+`aorus-lcd <command> --help` for the full text of each option.
+
+- **`probe`** checks that the controller answers and shows the adapter, bus and raw status.
+  `--wait SECS` keeps retrying, for after a boot.
+- **`status`** shows firmware, mode, on-state, widgets and the carousel banks.
+- **`mode`**: 0 to 2 are the stat screens, 3 image, 4 text, 5 GIF, 6 chibi clock, 7 carousel, 8 preset
+  rotation. Mode 8 is what the card reported at rest. What it does is known only from upstream notes
+  on an RTX 5080: a rotation of the built-in screens plus stored user content.
+- **`image`**, **`gif`**: the picture is resized to 320x170 without keeping its aspect ratio. `image`
+  reads PNG, JPEG, BMP, GIF and WebP. A GIF can have at most 255 frames. `--frame-delay` is at least
+  1, and more than 255 is sent as 255. Without it, the mean delay of the GIF's frames is used.
+- **`text`** centres the text on the panel. A line break or a literal `\n` starts a new line, and long
+  lines wrap on spaces. The default colour is `8b8d8b`, the grey the rainbow effect needs, on `000000`
+  at size 28. By default this also starts the rainbow effect, whose frame writes NVRAM: use
+  `--no-effect` to avoid that.
+- **`carousel`** takes modes such as `0,1,4`, each from 0 to 6, and an `--interval` that defaults to
+  5 and is sent as it is. It only stores the list and does not change the mode, so `aorus-lcd mode 7`
+  is needed to play it. Whether it then plays is [unverified](#status).
+- **`dashboard`** chooses the widgets, from `temp`, `clock`, `usage`, `fan`, `ramclock`, `vram`, `fps`
+  and `power`. The defaults are `temp,clock,usage,fan,vram,power` every 3 s. `--off` turns every
+  widget off. The setting is not saved, and widgets freeze without a running daemon.
+- **`recover`** is described under [Troubleshooting](#troubleshooting).
+- **`save`** writes the panel configuration to NVRAM. In text mode the same frame also starts the
+  rainbow effect.
+
+Commands that write NVRAM: `save`, `image --save`, `recover --save`, and `text` without
+`--no-effect`. The daemon never does.
+
+An upload sends no `E1`, so a sensor overlay stays on top of the content. `--no-overlay` sends `E1`
+with no widgets after a successful upload, which clears the panel's selection rather than hiding it.
+It stays cleared until `dashboard` sets it or a daemon connects, because the daemon puts widgets back
+on a panel that has none.
+
+The daemon does not need stopping for an upload or `recover`: they share the bus lock, and it skips
+its ticks while they run.
+
+## Daemon
+
+`aorus-lcd daemon` pushes the sensor values the widgets need, and retries by itself while `i2c-dev`,
+the adapter, NVML or the panel are not ready. It stops on SIGTERM or SIGINT and sends nothing on the
+way out, so the panel is left as it is.
+
+```bash
+systemctl status aorus-lcd
+journalctl -u aorus-lcd -b
+```
+
+For more detail in the journal, add `-v` before `daemon` in a drop-in for `ExecStart`.
+
+### Config
+
+The daemon reads `/etc/aorus-lcd.toml` once at start, if it exists. `--config PATH` reads another
+file instead, which then must exist. Options on the command line beat the file, and the file beats
+the defaults. An unknown key, a bad value, or a file that exists but cannot be read stops the daemon
+before it touches the bus. See [`dist/aorus-lcd.toml`](dist/aorus-lcd.toml).
+
+| Key | Option | Values | Default |
+|---|---|---|---|
+| `widgets` | `--widgets` | One comma-separated string of the widget names above | Keep what the panel has |
+| `interval` | `--interval` | Seconds per widget, 1 to 255. Needs `widgets`, or it is an error. | 3, when widgets are named |
+| `feed` | `--feed` | `"adaptive"` or `"steady"` | `"adaptive"` |
+| `frame_bytes` | `--frame-bytes` | 256 or 128 | 256 |
+| `bus` | `--bus` | An NVIDIA adapter's bus number | Autodetect |
+
+The daemon sends `E1` only if the panel needs it, so a config that names no widgets keeps the panel's
+selection and interval. The exception is a panel with no widget enabled, which gets the defaults
+above. With `widgets` set, `E1` goes out on connect whenever the panel's widgets or interval differ.
+`E1` is untested on this hardware and is the prime suspect in upstream's dark-panel incidents, so
+leave `widgets` out unless you need it.
+
+### Feed cost
+
+The panel needs regular `E3` frames, and each one is an I2C write while you may be gaming.
+
+- One 256-byte write cost 28 ms on average and 38 ms at most, consistent with a 100 kHz bus. The same
+  bus runs at 400 kHz on Windows, and Linux offers no way to change this.
+- With a 1 Hz feed, other NVIDIA driver calls stalled once per second, for up to 35 ms. With the feed
+  off, none stalled over 10 ms in 60 s. This stall is a proxy, measured as `nvmlDeviceGetMemoryInfo`
+  latency. It is not a measured game frame drop.
+
+That is why the default is `--feed adaptive`: a frame every second under 50% GPU usage, and from there
+up a pair of frames about every 6 s, carrying the last 5 s of peaks (temperature, fan, power) and
+averages (clocks, usage). The widgets stay visible under load but update less often. `--feed steady`
+sends a frame every second at any load. What either feed costs in frame rate is unknown, and no
+frame-rate gain is claimed.
+
+Upstream measured 1% lows of about 141 fps with a 1 Hz feed against about 182 with almost no writes.
+That was on an RTX 5080 on Windows and has not been reproduced here.
+
+`--frame-bytes 128` means less time on the bus but is unreliable on this card: 21 of 163 writes were
+refused against 1 of 162 at 256 bytes, and 5 of 12 `status` polls failed during the feed.
+
+## Troubleshooting
+
+### The widgets do not match `nvidia-smi`
+
+This is expected. Fixed test values proved that the panel shows exactly what is sent.
+
+| Widget | Panel | `nvidia-smi` |
+|---|---|---|
+| Fan | RPM, or percent if the RPM call fails | Percent |
+| RAM usage | Percent of VRAM | MiB |
+| Power | Instant | Averaged |
+
+Values lag about 1 s, and under load the adaptive feed adds the peaks and averages described in
+[Feed cost](#feed-cost). The FPS widget stays at 0 because NVML has no FPS source. A sensor that fails
+also shows 0.
+
+### The panel is frozen or stale
+
+The panel keeps standby power across a reboot, so old content can stay on it after a crash. Without a
+running daemon the widgets freeze or go blank, and a daemon that stops or crashes sends nothing to
+clear them.
+
+```bash
+systemctl status aorus-lcd
+sudo systemctl restart aorus-lcd
+```
+
+The unit restarts after a failure, but gives up after 5 failed starts in 5 minutes. Fix the cause
+shown in the journal, then run `sudo systemctl reset-failed aorus-lcd` before starting it again.
+
+### Recovering the panel
+
+This order comes from [`docs/RECOVERY.md`](https://github.com/CodeTorchAI/AorusLcd/blob/main/docs/RECOVERY.md)
+of CodeTorchAI/AorusLcd, whose incidents these are. `recover` on an actually dark panel is
+[unverified](#status) here. Start with `aorus-lcd status`, which sends only the probe and read-backs,
+and make sure nothing else is using the bus.
+
+1. **Wedged framebuffer.** The panel reports a sane mode and on-state but shows a frozen image. A mode
+   change alone does not repaint it, because the wedged content sits in the framebuffer and only an
+   upload clears it. `aorus-lcd recover` does this: it turns the panel off and on, uploads a solid
+   frame, and switches to the target mode, 0 by default. It sends no `E1` and writes no NVRAM.
+   `--mode`, `--color`, `--no-powercycle` and `--no-upload` adjust those steps.
+
+2. **Dark panel that reports healthy.** Every read looks right and there is no light in any mode, and
+   status cannot tell this from step 1. Upstream hit this twice. Every attempt known to have sent `E1`
+   stayed dark, and both attempts without it lit the panel, each as a repeated power cycle. So run
+   `aorus-lcd recover` again, with no `--overlay`, and keep `widgets` out of the daemon's config while
+   you do. Upstream's working runs used a red frame (`--color FF0000`), probably by chance. There is
+   no backlight command to fall back on.
+
+3. **Cold power cycle.** If nothing lights it, shut down fully, then switch the PSU off or pull the
+   cord for about 30 seconds. A reboot is not enough, because the module keeps standby power across
+   one.
+
+`--save` also writes the result to NVRAM, and is off by default so that a repair persists nothing.
+`--overlay` sends `E1` with GPU temperature and TGP, and `--clear-overlay` sends it with no widgets.
+A daemon started after `--clear-overlay` puts its default widgets back.
+
+### Messages
+
+The controller can need up to a minute after boot. Use `aorus-lcd probe --wait 60`. The daemon waits
+by itself.
+
+| Message | Cause and fix |
+|---|---|
+| `writing to the panel on /dev/i2c-N: no answer from the panel controller` | The controller is not up yet, or this is not a supported card. Wait as above. |
+| `no adapter named "NVIDIA i2c adapter 1 at ..."; adapters seen:` | `sudo modprobe i2c-dev`, and check that the NVIDIA driver is loaded. |
+| `opening /dev/i2c-N: no such device, is the i2c-dev kernel module loaded?` | `sudo modprobe i2c-dev`. |
+| `opening /dev/i2c-N: permission denied, is this user in the i2c group?` | Add yourself to `i2c` and log in again, and check that the udev rule is installed. |
+| `cannot open bus lock /run/aorus-lcd.lock: check the aorus-lcd tmpfiles.d entry and membership of the i2c group, ...` | Run the `systemd-tmpfiles --create` step from Setup, and check your groups. |
+| `bus lock /run/aorus-lcd.lock is held by another process` | Another `aorus-lcd` kept the bus for over 5 s, usually an upload. Wait for it to finish. |
+| `cannot recover while another process holds the bus: stop the daemon with ...` | The same for `recover`. Let the upload finish, or follow the message. |
+| `refusing --bus N: i2c-N is "...", not an NVIDIA adapter` | `--bus` named the wrong adapter. Leave it out to autodetect. |
+| Service fails with status `216/GROUP` | The `i2c` group does not exist: `sudo groupadd -f i2c`. |
+
+The lock message also offers `AORUS_LCD_LOCK`, which replaces the lock path until the tmpfiles entry
+is installed. Every process sharing the bus must use the same value. Two tools with different values
+no longer exclude each other, and that includes the service, which does not see your shell's
+environment.
 
 ## Safety
 
-- Writes only to `0x61` on the verified NVIDIA adapter. Never to the RGB controller.
-- No firmware flashing, no persistent GPU state beyond the panel's own image memory/NVRAM.
-- Worst failure seen in the reference project: stale or black panel until the next upload
-  or a power cycle, never a bricked card. Still: use at your own risk.
-- Don't run GCC-like tools or OpenRGB writes to this bus at the same time.
+- Writes only to `0x61` on a verified NVIDIA adapter, never to the RGB controller at `0x75`, and
+  refuses to write if the `EB 03` probe fails.
+- No firmware flashing, and no persistent GPU state beyond the panel's own image memory and NVRAM.
+- Worst failure seen in the reference project: stale or black panel until the next upload or a power
+  cycle, never a bricked card. Still: use at your own risk.
+- Don't run GCC-like tools or OpenRGB writes to this bus at the same time. They do not honour the
+  lock.
 
----
+## Protocol notes
 
-## Notes for implementing with Claude Code
-
-1. Before writing protocol code, read `aorus_lcd.py` from albancreton/aorus-master-linux
-   and `docs/PROTOCOL.md` from CodeTorchAI/AorusLcd. Copy byte layouts from there, never
-   invent them.
-2. Treat the Python script as the oracle: generate test vectors with it (frames as hex)
-   and assert byte equality in Rust tests.
-3. Build the pure layers (`protocol`, `rle`) with tests first, hardware layers last.
-4. Use `--dry-run` for anything not yet verified on hardware; ask before the first real
-   write of each new opcode.
-5. Work milestone by milestone; M3 (daemon) is the priority.
-
----
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md) has the frame formats, opcodes, upload sequence, design rules
+and source layout.
 
 ## Credits and license
 

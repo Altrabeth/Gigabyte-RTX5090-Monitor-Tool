@@ -797,8 +797,8 @@ pub enum LoopEntry {
     Empty,
     /// A mode `F3` can set.
     Mode(Mode),
-    /// A raw value `F3` cannot set. Kept rather than refused, because `F4` has
-    /// not been seen on real hardware and one odd slot should not fail `status`.
+    /// A raw value `F3` cannot set. Kept rather than refused, because one odd
+    /// slot should not fail `status`.
     Unknown(u8),
 }
 

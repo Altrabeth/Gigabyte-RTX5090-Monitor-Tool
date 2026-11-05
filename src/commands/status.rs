@@ -57,7 +57,7 @@ fn report(status: &PanelStatus) -> Result<String> {
         format!("mode:      {}", mode_line(&status.mode)),
         format!("on:        {}", if status.mode.on { "yes" } else { "no" }),
         format!("dashboard: {}", dashboard_line(&status.display)),
-        "carousel banks: raw bytes, then the inferred interval and slots".to_owned(),
+        "carousel banks: raw bytes, then the interval and slots".to_owned(),
     ];
     for bank in &status.loop_banks {
         lines.push(bank_line(bank)?);
@@ -87,9 +87,9 @@ fn dashboard_line(display: &DisplayStatus) -> String {
     format!("{widgets}, every {} s", display.interval_s)
 }
 
-/// The raw bytes come first and always print, because `F4` has not been seen on
-/// real hardware and its offsets are inferred: they are what shows whether
-/// [`parse_loop_bank`](aorus_lcd::protocol::parse_loop_bank) has it right.
+/// The raw bytes come first and always print, because bytes 4 to 7 of an `F4`
+/// reply are unexplained, and [`parse_loop_bank`](aorus_lcd::protocol::parse_loop_bank)
+/// reads only the bytes the real panel confirmed: the interval and three slots.
 fn bank_line(bank: &LoopBankRead) -> Result<String> {
     let parsed = bank.parsed()?;
     let slots: Vec<String> = parsed.entries.into_iter().map(slot_label).collect();
@@ -203,7 +203,7 @@ mod tests {
             "mode:      5 GIF (raw 0x06)".to_owned(),
             "on:        yes".to_owned(),
             "dashboard: GPU temperature, GPU usage, power, every 3 s".to_owned(),
-            "carousel banks: raw bytes, then the inferred interval and slots".to_owned(),
+            "carousel banks: raw bytes, then the interval and slots".to_owned(),
             bank(1),
             bank(2),
             bank(3),
