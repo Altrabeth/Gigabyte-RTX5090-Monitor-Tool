@@ -126,11 +126,12 @@ firmware 1.3, driver 615.78.08, subsystem `1458:416e`, kernel 6.18.
 - Frame-rate effect in real games. The 35 ms driver stall under [Feed cost](#feed-cost) is a proxy.
 - Suspend and resume.
 
-<!-- Placeholder for the soak result. -->
-Soak test: pending.
+**Soak test:** 3 hours with the default settings on an idle GPU, never above 5%. 10,749 of 10,755
+`E3` writes succeeded, with no reconnects and no unexplained mode change. It says nothing about long
+runs under load, and nobody watched the screen for the whole run.
 
 **Open issue:** once the panel reported mode 5 (GIF) after feed tests without any `E5` being sent,
-and three later attempts did not reproduce it. It is unexplained. If it happens, run
+and neither three later attempts nor the soak test reproduced it. It is unexplained. If it happens, run
 `aorus-lcd mode 0`.
 
 ## Commands
@@ -161,7 +162,8 @@ adapter, `--dry-run`, which prints the frames and touches no bus, and `-v`, repe
   `--wait SECS` keeps retrying, for after a boot.
 - **`status`** shows firmware, mode, on-state, widgets and the carousel banks.
 - **`mode`**: 0 to 2 are the stat screens, 3 image, 4 text, 5 GIF, 6 chibi clock, 7 carousel, 8 preset
-  rotation. Mode 8 is what the card reported at rest. What it does is known only from upstream notes
+  rotation. No built-in screen shows more than one stat at a time, checked by eye on modes 0, 1, 2
+  and 6 and on an image: widgets rotate one by one. Mode 8 is what the card reported at rest. What it does is known only from upstream notes
   on an RTX 5080: a rotation of the built-in screens plus stored user content.
 - **`image`**, **`gif`**: the picture is resized to 320x170 without keeping its aspect ratio. `image`
   reads PNG, JPEG, BMP, GIF and WebP. A GIF can have at most 255 frames. `--frame-delay` is at least
