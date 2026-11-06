@@ -46,7 +46,15 @@ sudo systemd-tmpfiles --create /etc/tmpfiles.d/aorus-lcd.conf
 sudo usermod -aG i2c "$USER"
 ```
 
-Log out and back in so the group applies, then install the binary and the daemon:
+The group only applies after a reboot. Logging out is usually not enough, because `systemd --user`
+survives it with the old groups, and a Plasma session runs under it. To carry on without rebooting,
+start a shell with the group for now. The service does not need this.
+
+```bash
+newgrp i2c
+```
+
+Then install the binary and the daemon:
 
 ```bash
 sudo install -Dm755 target/release/aorus-lcd /usr/local/bin/aorus-lcd
@@ -328,8 +336,8 @@ by itself.
 | `writing to the panel on /dev/i2c-N: no answer from the panel controller` | The controller is not up yet, or this is not a supported card. Wait as above. |
 | `no adapter named "NVIDIA i2c adapter 1 at ..."; adapters seen:` | `sudo modprobe i2c-dev`, and check that the NVIDIA driver is loaded. |
 | `opening /dev/i2c-N: no such device, is the i2c-dev kernel module loaded?` | `sudo modprobe i2c-dev`. |
-| `opening /dev/i2c-N: permission denied, is this user in the i2c group?` | Add yourself to `i2c` and log in again, and check that the udev rule is installed. |
-| `cannot open bus lock /run/aorus-lcd.lock: check the aorus-lcd tmpfiles.d entry and membership of the i2c group, ...` | Run the `systemd-tmpfiles --create` step from Setup, and check your groups. |
+| `opening /dev/i2c-N: permission denied, is this user in the i2c group?` | Add yourself to `i2c` and reboot, or run `newgrp i2c` for this shell, and check that the udev rule is installed. |
+| `cannot open bus lock /run/aorus-lcd.lock: check the aorus-lcd tmpfiles.d entry and membership of the i2c group, ...` | Run the `systemd-tmpfiles --create` step from Setup. If you just joined `i2c`, reboot or run `newgrp i2c`: check with `id`, not `groups katee`, which reads the group file instead of your session. |
 | `bus lock /run/aorus-lcd.lock is held by another process` | Another `aorus-lcd` kept the bus for over 5 s, usually an upload. Wait for it to finish. |
 | `cannot recover while another process holds the bus: stop the daemon with ...` | The same for `recover`. Let the upload finish, or follow the message. |
 | `refusing --bus N: i2c-N is "...", not an NVIDIA adapter` | `--bus` named the wrong adapter. Leave it out to autodetect. |
