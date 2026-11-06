@@ -38,8 +38,9 @@ pub const DESCRIPTOR: [u8; 12] = [
     0x01, 0x00, 0x0B, 0xA9, 0x01, 0x00, 0x40, 0x01, 0xAA, 0x00, 0x01, 0x00,
 ];
 
-/// `AA`: persists the panel configuration to NVRAM. The same frame triggers the
-/// text rainbow effect, so applying that effect also saves.
+/// `AA`: persists the panel configuration to NVRAM. The references also send it
+/// as the text rainbow trigger, but the rainbow was seen here in a run without it:
+/// `docs/PROTOCOL.md` section 2.
 pub const OP_SAVE: u8 = 0xAA;
 /// `D6`: reads the firmware version.
 pub const OP_GET_FW_VERSION: u8 = 0xD6;
@@ -472,8 +473,8 @@ pub fn carousel_frame(interval: u8, modes: &[Mode]) -> Result<Frame> {
 
 /// Builds `AA`.
 ///
-/// This writes NVRAM, and the same frame is the text rainbow trigger, so
-/// applying that effect also saves. The daemon must never send it.
+/// This writes NVRAM, also when sent as the references' text rainbow trigger.
+/// The daemon must never send it.
 pub fn save_frame() -> Frame {
     cmd_frame(OP_SAVE, &[])
 }

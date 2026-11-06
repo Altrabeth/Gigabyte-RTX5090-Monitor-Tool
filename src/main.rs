@@ -81,14 +81,16 @@ enum Command {
     Recover(commands::recover::Args),
     /// Save the panel configuration: this writes to the panel's NVRAM
     ///
-    /// In text mode the same frame also starts the text rainbow effect.
+    /// The references also send this frame to start the rainbow in text mode. See
+    /// --no-effect in the help of the text command.
     Save(commands::save::Args),
     /// Show firmware, mode, on-state, dashboard and carousel banks
     Status(commands::status::Args),
     /// Show text
     ///
-    /// By default this also starts the rainbow effect, whose frame saves the panel
-    /// configuration to NVRAM. Use --no-effect to avoid that write.
+    /// By default this also sends AA, which saves the panel configuration to NVRAM.
+    /// Use --no-effect to skip that write. The text may still show in a rainbow, as
+    /// that option explains.
     Text(commands::text::Args),
 }
 

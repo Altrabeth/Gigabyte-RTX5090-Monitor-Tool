@@ -334,9 +334,9 @@ impl<T: Transport> Panel<T> {
 
     /// Persists the panel configuration to NVRAM (`AA`).
     ///
-    /// **This writes NVRAM.** The same frame also triggers the text rainbow
-    /// effect. Only an explicit user request may lead here, and the daemon must
-    /// never call it.
+    /// **This writes NVRAM.** The references also send this frame as the text
+    /// rainbow trigger: `docs/PROTOCOL.md` section 2. Only an explicit user request
+    /// may lead here, and the daemon must never call it.
     pub fn save(&mut self) -> Result<()> {
         self.transport.write(&save_frame())
     }

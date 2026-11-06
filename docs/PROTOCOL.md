@@ -46,7 +46,7 @@ Every command is one 256-byte write:
 | `E1` | SetDisplay | Widget flags and rotation interval, section 3 |
 | `E3` | SensorFeed | Live values, section 4 |
 | `EA` | SetImageTpl | Overlay template, section 5 |
-| `AA` | Save | Persists the configuration to panel NVRAM. The same frame starts the text rainbow effect, so applying that effect also saves. The daemon never sends it. |
+| `AA` | Save | Persists the configuration to panel NVRAM. The references also send it as the text rainbow trigger, see below. The daemon never sends it. |
 | `F3` | SetLoop | `[5]` = interval, `[6..]` = mode + 1 list. Accepts modes 0 to 6 only. |
 | `F2` / `F1` | Upload marker, header | Section 6 |
 | `D6` | GetFWVersion | Read 4 |
@@ -54,6 +54,12 @@ Every command is one 256-byte write:
 | `DF` | GetDisplay | Read 4: widget bitmask in byte 1, interval in byte 2 |
 | `F4` | GetLoop | `[5]` = bank 1 to 5, read 8 |
 | `EB 03` | GetImageTpl | Read 8. Doubles as the presence probe. |
+
+`aorus_lcd.py` and `PanelController.cs` send `AA` in text mode as the trigger of the panel's text
+rainbow. What was seen here differs. On firmware 1.3, `text --no-effect --color ffaa00` showed the
+correct text in a wandering rainbow, not orange, with no `AA` in that run and one `AA` sent earlier
+in mode 0. That is one run. Whether the rainbow is permanent in text mode or was enabled by that
+save is unknown.
 
 `F3` stores the list and does not change the mode, so playing a carousel needs `E5` as well.
 
@@ -84,9 +90,10 @@ not part of the carousel, and their meaning is unknown. A shorter list clears th
 All-zero flags turn the dashboard off.
 
 Send `E1` at most once on (re)connect, only if `DF` shows the panel needs it, and never
-periodically. It is the prime suspect in upstream's dark-panel incidents. This tool has never sent
-it to the real panel, which already held a widget config: `DF` read all eight widgets every 4 s on a
-panel this tool had not written to.
+periodically. It is the prime suspect in upstream's dark-panel incidents. `dashboard` has sent it
+to the real panel twice, with no dark-panel event: `--off` read back as no widgets and the overlay
+went from the panel, and all eight widgets every 4 s read back correctly. Before that, `DF` read
+those eight widgets on a panel this tool had not written to.
 
 The `brightness` command of `aorus_lcd.py` reuses `E1` with inferred meaning and is left out here.
 
