@@ -104,23 +104,28 @@ firmware 1.3, driver 615.78.08, subsystem `1458:416e`, kernel 6.18.
 - GIFs play all frames, with the first frame sent twice.
 - `E3` layout: fixed test values showed exactly on all 8 widgets.
 - Adaptive feed under load: widgets stay visible and update about every 6 s.
+- `text` renders correctly, but not in the colour asked for. `text "..." --no-effect --color ffaa00`
+  showed the right text in a wandering rainbow, not orange. No `AA` was sent in that run, and one had
+  been sent earlier in mode 0. That is one run, and whether the rainbow is permanent in text mode or
+  was enabled by that save is unknown.
+- `dashboard --off` read back as no widgets, and the overlay disappeared from the panel.
 
 **Confirmed by read-back only**, so the panel's answers were right but nobody checked the screen:
 
 - `probe`, `status`, `on`, `off`
 - `mode` 0, 1, 7 and 8
 - `carousel` storing its list
+- `dashboard` with all 8 widgets at 4 s
 - `recover` with default options
 - `save`
 
 **Not verified:**
 
-- `text` on the real panel, including the rainbow effect.
+- What `AA` does in text mode: the `text` run above sent none.
 - Whether the carousel actually plays after `mode 7`, and the unit of its interval.
 - `recover` on an actually dark panel, or with `--overlay` or `--clear-overlay`.
-- `E1` was never sent to the real panel. The daemon has not needed it, because the panel already
-  held a widget config. So `dashboard`, `--no-overlay`, and any other path that sends `E1` are
-  untested on hardware.
+- `--no-overlay`, and an `E1` sent by the daemon. `E1` has reached the real panel only through the
+  two `dashboard` runs above, with no dark-panel event.
 - Whether `AA`, the save frame, survives a cold power-off.
 - The systemd unit and the PKGBUILD have never been installed, because no root was available.
 - Frame-rate effect in real games. The 35 ms driver stall under [Feed cost](#feed-cost) is a proxy.
@@ -164,14 +169,19 @@ adapter, `--dry-run`, which prints the frames and touches no bus, and `-v`, repe
 - **`mode`**: 0 to 2 are the stat screens, 3 image, 4 text, 5 GIF, 6 chibi clock, 7 carousel, 8 preset
   rotation. No built-in screen shows more than one stat at a time, checked by eye on modes 0, 1, 2
   and 6 and on an image: widgets rotate one by one. Mode 8 is what the card reported at rest. What it does is known only from upstream notes
-  on an RTX 5080: a rotation of the built-in screens plus stored user content.
+  on an RTX 5080: a rotation of the built-in screens plus stored user content. The firmware overlay
+  is drawn over GIF content too, checked by eye: a value appeared over a GIF while widgets were
+  enabled, and vanished once they were cleared.
 - **`image`**, **`gif`**: the picture is resized to 320x170 without keeping its aspect ratio. `image`
   reads PNG, JPEG, BMP, GIF and WebP. A GIF can have at most 255 frames. `--frame-delay` is at least
   1, and more than 255 is sent as 255. Without it, the mean delay of the GIF's frames is used.
 - **`text`** centres the text on the panel. A line break or a literal `\n` starts a new line, and long
-  lines wrap on spaces. The default colour is `8b8d8b`, the grey the rainbow effect needs, on `000000`
-  at size 28. By default this also starts the rainbow effect, whose frame writes NVRAM: use
-  `--no-effect` to avoid that.
+  lines wrap on spaces. The default colour is `8b8d8b`, the reference's grey for the panel's rainbow,
+  on `000000` at size 28. By default this also sends `AA`, which writes NVRAM, and the references
+  expect that frame to start the rainbow. `--no-effect` skips `AA`, so it means no NVRAM write. Do not
+  expect it to stop the rainbow: the one run seen had the rainbow without `AA`, and `--color` made no
+  visible difference, see [Status](#status). For fixed-colour text, render it to a picture and use
+  `image`, which avoids text mode.
 - **`carousel`** takes modes such as `0,1,4`, each from 0 to 6, and an `--interval` that defaults to
   5 and is sent as it is. It only stores the list and does not change the mode, so `aorus-lcd mode 7`
   is needed to play it. Whether it then plays is [unverified](#status).
@@ -179,8 +189,8 @@ adapter, `--dry-run`, which prints the frames and touches no bus, and `-v`, repe
   and `power`. The defaults are `temp,clock,usage,fan,vram,power` every 3 s. `--off` turns every
   widget off. The setting is not saved, and widgets freeze without a running daemon.
 - **`recover`** is described under [Troubleshooting](#troubleshooting).
-- **`save`** writes the panel configuration to NVRAM. In text mode the same frame also starts the
-  rainbow effect.
+- **`save`** writes the panel configuration to NVRAM. The references also send this frame to start
+  the rainbow in text mode, see `text` above.
 
 Commands that write NVRAM: `save`, `image --save`, `recover --save`, and `text` without
 `--no-effect`. The daemon never does.
@@ -224,8 +234,9 @@ before it touches the bus. See [`dist/aorus-lcd.toml`](dist/aorus-lcd.toml).
 The daemon sends `E1` only if the panel needs it, so a config that names no widgets keeps the panel's
 selection and interval. The exception is a panel with no widget enabled, which gets the defaults
 above. With `widgets` set, `E1` goes out on connect whenever the panel's widgets or interval differ.
-`E1` is untested on this hardware and is the prime suspect in upstream's dark-panel incidents, so
-leave `widgets` out unless you need it.
+`E1` has been sent to this panel twice with no dark-panel event, but it is still the prime suspect
+in upstream's dark-panel incidents. The daemon avoids it unless needed, so leave `widgets` out unless
+you need it.
 
 ### Feed cost
 
