@@ -24,9 +24,10 @@ use aorus_lcd::daemon::{
 };
 use aorus_lcd::panel::Sleep;
 use aorus_lcd::protocol::{
-    display_frame, display_query_frame, probe_frame, sensor_frame, DisplayStatus, Elements,
-    FeedFrameLen, SensorSample, OP_GET_DISPLAY, OP_GET_IMAGE_TPL, OP_SAVE, OP_SENSOR_FEED,
-    OP_SET_DISPLAY, PROBE_READ_LEN,
+    display_frame, display_query_frame, mode_frame, mode_query_frame, probe_frame, sensor_frame,
+    DisplayStatus, Elements, FeedFrameLen, Mode, ModeStatus, SensorSample, OP_GET_DISPLAY,
+    OP_GET_IMAGE_TPL, OP_GET_MODE, OP_SAVE, OP_SENSOR_FEED, OP_SET_DISPLAY, OP_SET_MODE,
+    PROBE_READ_LEN,
 };
 use aorus_lcd::sensors::{FakeSensors, SensorSource};
 use aorus_lcd::session::{self, connect_with, Options, Session};
@@ -42,6 +43,13 @@ const READ_BACK: u8 = OP_GET_DISPLAY;
 const DASHBOARD: u8 = OP_SET_DISPLAY;
 const FEED: u8 = OP_SENSOR_FEED;
 const SAVE: u8 = OP_SAVE;
+const MODE_QUERY: u8 = OP_GET_MODE;
+const SET_MODE: u8 = OP_SET_MODE;
+/// The raw `DE` byte of mode 8, the preset rotation, which the real panel read
+/// after a power loss.
+const RAW_PRESET_ROTATION: u8 = 0x0B;
+/// The raw `DE` byte of mode 0.
+const RAW_STATS: u8 = 0x01;
 /// Far past anything a test expects, so a loop that never ends fails.
 const TIME_LIMIT_MS: u64 = 3_600_000;
 
@@ -141,6 +149,8 @@ struct Sent {
     locked: bool,
     /// What `DF` reported at the time of the write.
     panel: DisplayStatus,
+    /// The raw mode `DE` reported at the time of the write.
+    mode: u8,
 }
 
 impl Sent {
@@ -189,6 +199,8 @@ struct DeviceState {
     read_faults: RefCell<Vec<Fault>>,
     /// The widget mask and interval. A panel with no widgets unless set.
     panel: Cell<(u8, u8)>,
+    /// The raw mode byte `DE` reports, which `E5` sets.
+    mode: Cell<u8>,
     /// `E1` goes unnoticed, as if the controller had lost it right away.
     forgets_e1: Cell<bool>,
     no_answer_until: Cell<u64>,
@@ -240,9 +252,14 @@ impl Transport for Device {
             ok: fault.is_none(),
             locked,
             panel: panel_status(self.state.panel.get()),
+            mode: self.state.mode.get(),
         });
         if fault.is_none() && frame[0] == DASHBOARD && !self.state.forgets_e1.get() {
             self.store_dashboard(frame);
+        }
+        // `E5` carries the wire byte, which is also what `DE` reads back.
+        if fault.is_none() && frame[0] == SET_MODE {
+            self.state.mode.set(frame[5]);
         }
         let outcome = fault.map_or(Ok(()), |fault| Err((fault.error)()));
         drop(faults);
@@ -264,6 +281,9 @@ impl Transport for Device {
         if query.opcode() == READ_BACK {
             let (mask, interval) = self.state.panel.get();
             buf.copy_from_slice(&[READ_BACK, mask, interval, 0]);
+        }
+        if query.opcode() == MODE_QUERY {
+            buf.copy_from_slice(&[MODE_QUERY, self.state.mode.get(), 1, 0]);
         }
         Ok(())
     }
@@ -340,6 +360,11 @@ impl Rig {
             opcode: Some(opcode),
             error,
         });
+    }
+
+    /// The raw mode `DE` reports from now on.
+    fn panel_in_mode(&self, raw: u8) {
+        self.device.mode.set(raw);
     }
 
     /// What `DF` reports from now on.
@@ -533,10 +558,14 @@ fn assert_only_allowed_frames(trace: &[Sent]) {
 /// The rules of the wire, over a whole trace. Failed attempts count: a frame that
 /// reached the controller partly is still a frame sent.
 ///
-/// Every frame is `EB 03`, `DF`, the configured `E1`, or `E3`, all under the
-/// lock. Each `DF` directly follows a probe that went out. An `E1` directly
-/// follows a `DF` that got an answer, so there is at most one per connection, and
-/// only if that answer calls for it. `E3` needs that answer and any such `E1`.
+/// Every frame is `EB 03`, `DE`, the configured `E5`, `DF`, the configured `E1`,
+/// or `E3`, all under the lock. With a mode configured, each `DE` directly
+/// follows a probe that went out, an `E5` directly follows a `DE` that got an
+/// answer calling for it, and `DF` needs that answer and any such `E5`. Without
+/// one there is no `DE` or `E5`, and each `DF` directly follows a probe that
+/// went out. An `E1` directly follows a `DF` that got an answer, so there is at
+/// most one per connection, and only if that answer calls for it. `E3` needs that
+/// answer and any such `E1`.
 fn assert_allowed_frames(trace: &[Sent], config: DaemonConfig) {
     let wanted = config.dashboard();
     let dashboard = display_frame(wanted.elements, wanted.interval_s);
@@ -544,7 +573,10 @@ fn assert_allowed_frames(trace: &[Sent], config: DaemonConfig) {
         Some(_) => panel != wanted,
         None => panel.elements == Elements::NONE,
     };
+    let needs_e5 = |raw_mode: u8| ModeStatus { raw_mode, on: true }.mode() != config.mode;
     let mut probed = false;
+    let mut mode_read = None;
+    let mut mode_set = false;
     let mut read_back = None;
     let mut configured = false;
     for sent in trace {
@@ -552,13 +584,36 @@ fn assert_allowed_frames(trace: &[Sent], config: DaemonConfig) {
             PROBE => {
                 assert_eq!(sent.frame[..], probe_frame()[..], "not EB 03");
                 probed = sent.ok;
+                mode_read = None;
+                mode_set = sent.ok && config.mode.is_none();
                 read_back = None;
                 configured = false;
             }
+            MODE_QUERY => {
+                assert!(
+                    config.mode.is_some(),
+                    "DE with no mode configured: {sent:?}"
+                );
+                assert_eq!(sent.frame[..], mode_query_frame()[..], "not DE");
+                assert!(probed, "DE without a probe just before it: {sent:?}");
+                probed = false;
+                mode_read = sent.ok.then_some(sent.mode);
+                mode_set = sent.ok && !needs_e5(sent.mode);
+            }
+            SET_MODE => {
+                let mode = config.mode.expect("E5 with no mode configured");
+                assert_eq!(sent.frame[..], mode_frame(mode)[..], "an unexpected E5");
+                let raw = mode_read.take();
+                let raw = raw.expect("E5 without an answered DE just before it");
+                assert!(needs_e5(raw), "E5 for a panel in that mode: {sent:?}");
+                mode_set = sent.ok;
+            }
             READ_BACK => {
                 assert_eq!(sent.frame[..], display_query_frame()[..], "not DF");
-                assert!(probed, "DF without a probe just before it: {sent:?}");
+                assert!(mode_set, "DF without a probe or a settled mode: {sent:?}");
                 probed = false;
+                mode_read = None;
+                mode_set = false;
                 read_back = sent.ok.then_some(sent.panel);
                 configured = sent.ok && !needs_e1(sent.panel);
             }
@@ -572,6 +627,7 @@ fn assert_allowed_frames(trace: &[Sent], config: DaemonConfig) {
             FEED => {
                 assert_eq!(sent.frame.len(), config.feed.bytes());
                 assert!(configured, "E3 before the panel was ready: {sent:?}");
+                mode_read = None;
                 read_back = None;
             }
             SAVE => panic!("AA must never be sent: {sent:?}"),
@@ -796,6 +852,201 @@ fn the_feed_length_comes_from_the_config() {
     .unwrap();
 
     assert_eq!(rig.feed_frames()[0].len(), 128);
+}
+
+/// Mode 0 for `ticks` ticks.
+fn in_mode_0(ticks: Option<u64>) -> DaemonConfig {
+    DaemonConfig {
+        mode: Some(Mode::Faith1),
+        max_ticks: ticks,
+        ..steady()
+    }
+}
+
+#[test]
+fn without_a_mode_the_mode_is_neither_read_nor_set() {
+    let rig = Rig::new();
+    rig.panel_has(0xFF, 4);
+    rig.panel_in_mode(RAW_PRESET_ROTATION);
+
+    rig.ticks(2).unwrap();
+
+    assert_eq!(rig.opcodes(), [PROBE, READ_BACK, FEED, FEED]);
+    assert_eq!(rig.device.mode.get(), RAW_PRESET_ROTATION);
+    assert_only_allowed_frames(&rig.trace());
+}
+
+#[test]
+fn a_panel_already_in_the_mode_gets_no_e5() {
+    let rig = Rig::new();
+    rig.panel_has(0xFF, 4);
+    rig.panel_in_mode(RAW_STATS);
+    let config = in_mode_0(Some(2));
+
+    rig.run_configured(config, healthy).unwrap();
+
+    assert_eq!(rig.opcodes(), [PROBE, MODE_QUERY, READ_BACK, FEED, FEED]);
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+// Seen on the real panel after a power loss: mode 8, and no widgets every 0 s.
+#[test]
+fn a_panel_in_another_mode_gets_one_e5_before_df_and_e1() {
+    let rig = Rig::new();
+    rig.panel_has(0x00, 0);
+    rig.panel_in_mode(RAW_PRESET_ROTATION);
+    let config = in_mode_0(Some(2));
+
+    rig.run_configured(config, healthy).unwrap();
+
+    assert_eq!(
+        rig.opcodes(),
+        [PROBE, MODE_QUERY, SET_MODE, READ_BACK, DASHBOARD, FEED, FEED]
+    );
+    assert_eq!(rig.trace()[2].frame[..], mode_frame(Mode::Faith1)[..]);
+    assert_eq!(rig.device.mode.get(), RAW_STATS);
+    assert_eq!(rig.device.panel.get(), (0xAF, 3));
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+#[test]
+fn the_preset_rotation_can_be_the_mode_asked_for() {
+    let rig = Rig::new();
+    rig.panel_has(0xFF, 4);
+    rig.panel_in_mode(RAW_STATS);
+    let config = DaemonConfig {
+        mode: Some(Mode::PresetRotation),
+        ..in_mode_0(Some(1))
+    };
+
+    rig.run_configured(config, healthy).unwrap();
+
+    assert_eq!(rig.attempts(SET_MODE), [0]);
+    assert_eq!(rig.device.mode.get(), RAW_PRESET_ROTATION);
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+/// A mode read that fails until 7 seconds in sends nothing past it until then,
+/// and costs the normal backoff.
+fn assert_backs_off_without_e5(rig: &Rig) {
+    let config = in_mode_0(Some(1));
+
+    rig.run_configured(config, healthy).unwrap();
+
+    let connections = [0, 2000, 6000, 14_000];
+    assert_eq!(rig.attempts(PROBE), connections);
+    assert_eq!(rig.attempts(MODE_QUERY), connections);
+    assert_eq!(rig.attempts(SET_MODE), [14_000]);
+    assert_eq!(rig.attempts(READ_BACK), [14_000]);
+    assert_eq!(rig.delivered(FEED), [14_000]);
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+/// A panel with widgets, in mode 8.
+fn after_power_loss_with_widgets() -> Rig {
+    let rig = Rig::new();
+    rig.panel_has(0xFF, 4);
+    rig.panel_in_mode(RAW_PRESET_ROTATION);
+    rig
+}
+
+#[test]
+fn an_i2c_error_on_the_mode_read_sends_nothing_more_and_backs_off() {
+    let rig = after_power_loss_with_widgets();
+    rig.read_fault(0, 7000, MODE_QUERY, eio);
+
+    assert_backs_off_without_e5(&rig);
+}
+
+#[test]
+fn a_short_mode_read_sends_nothing_more_and_backs_off() {
+    let rig = after_power_loss_with_widgets();
+    rig.read_fault(0, 7000, MODE_QUERY, short_read);
+
+    assert_backs_off_without_e5(&rig);
+}
+
+#[test]
+fn a_failed_de_query_sends_nothing_more_and_backs_off() {
+    let rig = after_power_loss_with_widgets();
+    rig.fault(0, 7000, Some(MODE_QUERY), eio);
+
+    assert_backs_off_without_e5(&rig);
+}
+
+#[test]
+fn a_failed_e5_fails_the_connection_before_df() {
+    let rig = after_power_loss_with_widgets();
+    rig.fault(0, 1000, Some(SET_MODE), eio);
+    let config = in_mode_0(Some(1));
+
+    rig.run_configured(config, healthy).unwrap();
+
+    assert_eq!(rig.attempts(SET_MODE), [0, 2000]);
+    assert_eq!(rig.attempts(READ_BACK), [2000]);
+    assert_eq!(rig.delivered(FEED), [2000]);
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+#[test]
+fn a_permission_error_on_the_mode_read_is_fatal() {
+    let rig = Rig::new();
+    rig.read_fault(0, TIME_LIMIT_MS, MODE_QUERY, || errno_error(Errno::ACCESS));
+
+    let error = rig.run_configured(in_mode_0(None), no_sensors).unwrap_err();
+
+    assert!(matches!(error, Error::I2c { .. }), "{error:?}");
+    assert_eq!(rig.attempts(SET_MODE), []);
+    assert_eq!(rig.attempts(READ_BACK), []);
+}
+
+#[test]
+fn a_reconnect_reads_the_mode_again_and_sets_it_only_if_it_changed() {
+    let rig = Rig::new();
+    rig.panel_has(0xFF, 4);
+    rig.panel_in_mode(RAW_STATS);
+    rig.outage(500, 3500);
+    rig.outage(5500, 8500);
+    // A manual `mode 5` while the second connection runs.
+    let device = rig.device.clone();
+    rig.clock.at(5200, move || device.mode.set(0x06));
+    let config = in_mode_0(Some(9));
+
+    rig.run_configured(config, healthy).unwrap();
+
+    assert_eq!(rig.attempts(MODE_QUERY), [0, 5000, 10_000]);
+    assert_eq!(rig.attempts(SET_MODE), [10_000]);
+    assert_eq!(rig.device.mode.get(), RAW_STATS);
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+#[test]
+fn shutdown_during_the_mode_read_does_not_go_on_to_e5() {
+    let rig = after_power_loss_with_widgets();
+    rig.device.write_cost.set(ms(10));
+    rig.stop_at(15);
+
+    rig.run_configured(in_mode_0(None), healthy).unwrap();
+
+    assert_eq!(rig.opcodes(), [PROBE, MODE_QUERY]);
+}
+
+#[test]
+fn no_forbidden_frame_when_the_mode_is_set_on_each_connection() {
+    let rig = after_power_loss_with_widgets();
+    rig.read_fault(38_000, 40_000, MODE_QUERY, short_read);
+    // Lost again while the feed is failing, so a later connection needs E5 too.
+    let device = rig.device.clone();
+    rig.clock
+        .at(22_000, move || device.mode.set(RAW_PRESET_ROTATION));
+
+    run_through_everything(&rig, in_mode_0(None));
+
+    let trace = rig.trace();
+    assert_eq!(rig.delivered(SET_MODE).len(), 2, "{trace:?}");
+    let (asked, answered) = (rig.attempts(MODE_QUERY), rig.delivered(MODE_QUERY));
+    assert!(answered.len() < asked.len(), "the failed DE was not hit");
+    assert_eq!(rig.attempts(DASHBOARD), []);
 }
 
 #[test]
@@ -2114,6 +2365,49 @@ fn a_skipped_tick_costs_no_write_and_a_period_without_writes_reports_nothing() {
 }
 
 #[test]
+fn the_mode_decision_is_logged_once_per_connection() {
+    capture_log();
+    let rig = after_power_loss_with_widgets();
+    rig.outage(500, 3500);
+
+    rig.run_configured(in_mode_0(Some(5)), healthy).unwrap();
+
+    assert_eq!(
+        logged(Level::Info, "panel is in"),
+        [
+            "panel is in mode 8 (raw 0x0B): sending E5 with mode 0",
+            "panel is in mode 0 (raw 0x01): no E5 needed",
+        ]
+    );
+}
+
+#[test]
+fn a_mode_byte_with_no_meaning_is_logged_as_unknown_and_replaced() {
+    capture_log();
+    let rig = Rig::new();
+    rig.panel_has(0xFF, 4);
+    rig.panel_in_mode(0x09);
+
+    rig.run_configured(in_mode_0(Some(1)), healthy).unwrap();
+
+    assert_eq!(
+        logged(Level::Info, "panel is in"),
+        ["panel is in unknown mode (raw 0x09): sending E5 with mode 0"]
+    );
+    assert_eq!(rig.device.mode.get(), RAW_STATS);
+}
+
+#[test]
+fn without_a_mode_nothing_about_the_mode_is_logged() {
+    capture_log();
+    let rig = Rig::new();
+
+    rig.ticks(1).unwrap();
+
+    assert_eq!(logged(Level::Info, "panel is in"), [""; 0]);
+}
+
+#[test]
 fn a_dry_run_has_no_bus_to_measure() {
     capture_log();
     let rig = Rig::new();
@@ -2308,4 +2602,45 @@ fn dry_run_ends_on_a_closed_stdout_rather_than_reconnecting() {
 
     assert!(matches!(error, Error::I2c { .. }), "{error:?}");
     assert_eq!(rig.clock.elapsed_ms(), 0);
+}
+
+#[test]
+fn dry_run_with_a_mode_shows_de_and_e5_before_df_and_e1() {
+    let rig = Rig::new();
+    let output = Output::default();
+    let config = DaemonConfig {
+        mode: Some(Mode::Faith1),
+        max_ticks: Some(1),
+        ..DaemonConfig::default()
+    };
+
+    dry_run_on(&rig, config, no_sensors, output.clone()).unwrap();
+
+    let text = String::from_utf8(output.0.borrow().clone()).unwrap();
+    let position = |needle: &str| text.find(needle).expect(needle);
+    let order = [
+        "DE GetMode",
+        "so E5 is shown; a real run decides from DE",
+        "E5 SetMode",
+        "DF GetDisplay",
+        "so E1 is shown; a real run decides from DF",
+        "E1 SetDisplay",
+    ];
+    for pair in order.windows(2) {
+        assert!(position(pair[0]) < position(pair[1]), "{pair:?}: {text}");
+    }
+    let modes = text.lines().filter(|line| line.starts_with("E5 "));
+    assert_eq!(modes.count(), 1, "{text}");
+}
+
+#[test]
+fn dry_run_without_a_mode_shows_no_de_or_e5() {
+    let rig = Rig::new();
+    let output = Output::default();
+
+    dry_run(&rig, Some(1), output.clone()).unwrap();
+
+    let text = String::from_utf8(output.0.borrow().clone()).unwrap();
+    assert!(!text.lines().any(|line| line.starts_with("DE ")), "{text}");
+    assert!(!text.lines().any(|line| line.starts_with("E5 ")), "{text}");
 }

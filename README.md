@@ -72,15 +72,23 @@ sudo install -Dm644 dist/aorus-lcd.toml /etc/aorus-lcd.toml
 
 ### Boot into the stat screen
 
-The daemon does not set the display mode, so after a cold boot the panel shows what is saved in its
-NVRAM, which may not be a screen with widgets. Run this once. `save` writes the panel's NVRAM:
+The panel does not keep its display mode across a power loss: after one it read mode 8, the preset
+rotation, although it had been saved in mode 0. Mode 8 shows the stats only part of the time, and
+`aorus-lcd save` does not help. Let the daemon set the mode instead. Set this in
+`/etc/aorus-lcd.toml`, installed from the example config above, then restart the daemon:
 
-```bash
-aorus-lcd mode 0
-aorus-lcd save
+```toml
+mode = 0
 ```
 
-Whether a save survives a cold power-off has not been verified.
+```bash
+sudo systemctl restart aorus-lcd
+```
+
+Each time it connects, the daemon reads the mode and sends `E5` only if the panel is in another one.
+Since the mode did not survive the power loss, `E5` looks like RAM only, so this should cause no
+wear. A mode set by hand with `aorus-lcd mode`, or by an upload, stays until the daemon next
+connects, such as after a reboot or a lost bus.
 
 ### Package
 
@@ -254,6 +262,7 @@ before it touches the bus. See [`dist/aorus-lcd.toml`](dist/aorus-lcd.toml).
 | `feed` | `--feed` | `"adaptive"` or `"steady"` | `"adaptive"` |
 | `frame_bytes` | `--frame-bytes` | 256 or 128 | 256 |
 | `bus` | `--bus` | An NVIDIA adapter's bus number | Autodetect |
+| `mode` | `--mode` | A display mode, 0 to 8, as for `aorus-lcd mode` | Leave the mode alone |
 
 The daemon sends `E1` only if the panel needs it, so a config that names no widgets keeps the panel's
 selection and interval. The exception is a panel with no widget enabled, which gets the defaults

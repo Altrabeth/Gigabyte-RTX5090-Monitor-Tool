@@ -35,6 +35,16 @@
 # feed.
 #frame_bytes = 256
 
+# The display mode to set each time the daemon connects, 0 to 8, as for
+# `aorus-lcd mode`: 0 to 2 are the stat screens. The daemon reads the mode and
+# sends E5 only if the panel is in another one.
+#
+# The panel forgets its mode on a power loss and starts in mode 8, the preset
+# rotation, which shows the stats only part of the time. `aorus-lcd save` does not
+# keep it, so set it here. Leave this out to leave the mode alone. A mode set by
+# hand, or by an upload, stays until the daemon next connects. --mode beats this.
+#mode = 0
+
 # The I2C bus, instead of autodetecting. It must still be an NVIDIA adapter: any
 # other bus is refused, and that stops the daemon. --bus beats this.
 #bus = 3

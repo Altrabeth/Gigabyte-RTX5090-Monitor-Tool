@@ -25,7 +25,7 @@ use serde::Deserialize;
 use toml::Spanned;
 
 use crate::daemon::{DaemonConfig, FeedStrategy};
-use crate::protocol::{parse_widgets, Elements, FeedFrameLen};
+use crate::protocol::{parse_widgets, Elements, FeedFrameLen, Mode};
 use crate::{Error, Result};
 
 /// Where the daemon looks for a config file when `--config` does not say.
@@ -45,6 +45,8 @@ pub struct Settings {
     pub frame_bytes: Option<FeedFrameLen>,
     /// The I2C bus to use instead of autodetecting.
     pub bus: Option<u32>,
+    /// The display mode to set on each connection.
+    pub mode: Option<Mode>,
 }
 
 impl Settings {
@@ -56,6 +58,7 @@ impl Settings {
             feed: self.feed.or(lower.feed),
             frame_bytes: self.frame_bytes.or(lower.frame_bytes),
             bus: self.bus.or(lower.bus),
+            mode: self.mode.or(lower.mode),
         }
     }
 }
@@ -89,6 +92,7 @@ struct Keys {
     feed: Option<Spanned<String>>,
     frame_bytes: Option<Spanned<i64>>,
     bus: Option<Spanned<i64>>,
+    mode: Option<Spanned<i64>>,
 }
 
 /// A config file's text, to turn byte offsets into something a person can use.
@@ -143,6 +147,13 @@ fn frame_bytes_from(bytes: i64) -> Result<FeedFrameLen> {
         })
 }
 
+/// Leaves the range to [`Mode::try_from`], so the file and `--mode` agree.
+fn mode_from(number: i64) -> Result<Mode> {
+    u8::try_from(number)
+        .map_err(|_| Error::InvalidArgument(format!("display mode must be 0 to 8, not {number}")))
+        .and_then(Mode::try_from)
+}
+
 fn bus_from(bus: i64) -> Result<u32> {
     u32::try_from(bus)
         .map_err(|_| Error::InvalidArgument(format!("bus must be a bus number, not {bus}")))
@@ -166,6 +177,7 @@ pub fn parse(text: &str, path: &Path) -> Result<FileConfig> {
         feed: source.checked(keys.feed, |name| name.parse())?,
         frame_bytes: source.checked(keys.frame_bytes, frame_bytes_from)?,
         bus: source.checked(keys.bus, bus_from)?,
+        mode: source.checked(keys.mode, mode_from)?,
     };
     Ok(FileConfig {
         settings,
@@ -240,6 +252,7 @@ pub fn resolve(cli: Settings, file: &FileConfig) -> Result<Resolved> {
             interval_s: merged.interval.unwrap_or(defaults.interval_s),
             feed: merged.frame_bytes.unwrap_or(defaults.feed),
             strategy: merged.feed.unwrap_or(defaults.strategy),
+            mode: merged.mode,
             ..defaults
         },
         bus: merged.bus,
@@ -278,6 +291,7 @@ mod tests {
             feed = "adaptive"
             frame_bytes = 128
             bus = 3
+            mode = 8
         "#;
 
         assert_eq!(
@@ -288,15 +302,18 @@ mod tests {
                 feed: Some(FeedStrategy::Adaptive),
                 frame_bytes: Some(FeedFrameLen::Truncated),
                 bus: Some(3),
+                mode: Some(Mode::PresetRotation),
             }
         );
     }
 
     #[test]
     fn the_other_values_parse_too() {
-        let settings = parsed("interval = 1\nfeed = \"steady\"\nframe_bytes = 256\n").unwrap();
+        let settings =
+            parsed("interval = 1\nfeed = \"steady\"\nframe_bytes = 256\nmode = 0\n").unwrap();
 
         assert_eq!(settings.interval, Some(1));
+        assert_eq!(settings.mode, Some(Mode::Faith1));
         assert_eq!(settings.feed, Some(FeedStrategy::Steady));
         assert_eq!(settings.frame_bytes, Some(FeedFrameLen::Full));
     }
@@ -323,6 +340,9 @@ mod tests {
             ("frame_bytes = -128\n", 1, "256 or 128, not -128"),
             ("\nbus = -1\n", 2, "a bus number, not -1"),
             ("bus = 4294967296\n", 1, "a bus number, not 4294967296"),
+            ("\nmode = 9\n", 2, "display mode must be 0 to 8, not 9"),
+            ("mode = -1\n", 1, "display mode must be 0 to 8, not -1"),
+            ("mode = 256\n", 1, "display mode must be 0 to 8, not 256"),
             // Bad names.
             (
                 "\n\n\nfeed = \"burst\"\n",
@@ -341,6 +361,7 @@ mod tests {
             ("frame_bytes = \"256\"\n", 1, "expected i64"),
             ("feed = 1\n", 1, "a string"),
             ("bus = true\n", 1, "expected i64"),
+            ("mode = \"0\"\n", 1, "expected i64"),
             // Not TOML.
             ("\nfeed = \n", 2, ""),
             ("feed = \"steady\"\nfeed = \"steady\"\n", 2, "duplicate"),
@@ -384,24 +405,27 @@ mod tests {
         let temp = Some(Elements::NONE.with(Element::GpuTemp));
         let defaults = DaemonConfig::default();
         let all = "widgets = \"temp\"\ninterval = 7\nfeed = \"steady\"\n\
-                   frame_bytes = 128\nbus = 1\n";
+                   frame_bytes = 128\nbus = 1\nmode = 8\n";
         let every_option = Settings {
             widgets: Some(fps()),
             interval: Some(9),
             feed: Some(FeedStrategy::Adaptive),
             frame_bytes: Some(FeedFrameLen::Full),
             bus: Some(2),
+            mode: Some(Mode::Faith1),
         };
         let from_file = DaemonConfig {
             elements: temp,
             interval_s: 7,
             feed: FeedFrameLen::Truncated,
             strategy: FeedStrategy::Steady,
+            mode: Some(Mode::PresetRotation),
             ..defaults
         };
         let from_options = DaemonConfig {
             elements: Some(fps()),
             interval_s: 9,
+            mode: Some(Mode::Faith1),
             ..defaults
         };
 
@@ -437,6 +461,15 @@ mod tests {
                 None,
             ),
             (Settings::default(), "bus = 1\n", defaults, Some(1)),
+            (
+                Settings::default(),
+                "mode = 3\n",
+                DaemonConfig {
+                    mode: Some(Mode::Image),
+                    ..defaults
+                },
+                None,
+            ),
             // Everything from one source.
             (Settings::default(), all, from_file, Some(1)),
             (every_option, "", from_options, Some(2)),
@@ -470,6 +503,18 @@ mod tests {
                 all,
                 from_file,
                 Some(2),
+            ),
+            (
+                Settings {
+                    mode: Some(Mode::Faith1),
+                    ..Settings::default()
+                },
+                all,
+                DaemonConfig {
+                    mode: Some(Mode::Faith1),
+                    ..from_file
+                },
+                Some(1),
             ),
         ];
 
@@ -648,7 +693,7 @@ mod tests {
         let settings = config.settings;
         assert!(settings.widgets.is_some() && settings.interval.is_some());
         assert!(settings.feed.is_some() && settings.frame_bytes.is_some());
-        assert!(settings.bus.is_some());
+        assert!(settings.bus.is_some() && settings.mode.is_some());
         assert!(resolve(Settings::default(), &config).is_ok());
     }
 }

@@ -5,10 +5,11 @@
 //! [`run_with`] is a state machine over injected parts, which is how every
 //! failure below is tested on a fake clock:
 //!
-//! - **Connect:** through the [write gate](crate::session), then `DF`, then at
-//!   most one `E1`, then `E3` until the bus fails. `EB 03`, `DF`, that `E1` and
-//!   `E3` are all this module sends: `AA` writes NVRAM. See below for when `E1`
-//!   goes out.
+//! - **Connect:** through the [write gate](crate::session), then, if a mode is
+//!   configured, `DE` and at most one `E5`, then `DF` and at most one `E1`, then
+//!   `E3` until the bus fails. `EB 03`, `DE`, that `E5`, `DF`, that `E1` and `E3`
+//!   are all this module sends: `AA` writes NVRAM. See below for when `E5` and
+//!   `E1` go out.
 //! - **Ticks** run on deadlines, each the previous one plus [`TICK`], so the
 //!   time spent working does not add up. A missed deadline is dropped rather
 //!   than made up for: late frames carry stale values, and a burst of them is
@@ -23,12 +24,28 @@
 //!   reads as a failure, where a repeated value would look live.
 //! - **Shutdown** sends nothing: the panel is left exactly as it is.
 //!
+//! # When `E5` goes out
+//!
+//! The display mode is RAM state. After a power loss the real panel read mode 8,
+//! the preset rotation, although it had been in mode 0 when `AA` was sent, and
+//! mode 8 shows the stats only part of the time. So `save` cannot make a mode
+//! stick, and the daemon sets it instead: with [`DaemonConfig::mode`] set, each
+//! connection reads `DE` and sends `E5` only if the panel is in another mode.
+//! Unset, the daemon reads and sends neither, and the mode is left alone.
+//!
+//! This comes before `DF`, so a connection's mode is settled before its widgets.
+//! A mode set by hand, or by an upload, stays until the daemon next connects.
+//! A failed `DE` never leads to a blind `E5`: like a failed `DF`, it fails the
+//! connection and takes the normal backoff, and nothing else goes out on it. A
+//! dry-run prints the `DE` query and the `E5` a real run might send.
+//!
 //! # When `E1` goes out
 //!
-//! `E1` is the prime suspect in dark-panel incidents (`RECOVERY.md`), and the
-//! panel keeps its widget config across boots: `DF` read all eight widgets every
-//! 4 s on a panel this tool had never written to. So each connection reads `DF`
-//! and sends `E1` only for a reason:
+//! `E1` is the prime suspect in dark-panel incidents (`RECOVERY.md`). The widget
+//! config often outlives a reboot: `DF` read all eight widgets every 4 s on a
+//! panel this tool had never written to. It does not outlive everything, though:
+//! after a power loss the same panel read no widgets every 0 s. So each
+//! connection reads `DF` and sends `E1` only for a reason:
 //!
 //! - If the config names widgets, when the panel's widgets or interval differ.
 //! - If it names none, when the panel has no widget enabled, and then the
@@ -131,7 +148,8 @@ use crate::bus::transport::{DryRun, Transport};
 use crate::error::{Error, Result};
 use crate::panel::{Panel, Sleep, ThreadSleep};
 use crate::protocol::{
-    parse_widgets, DisplayStatus, Elements, FeedFrameLen, SensorSample, DEFAULT_WIDGETS,
+    parse_widgets, DisplayStatus, Elements, FeedFrameLen, Mode, ModeStatus, SensorSample,
+    DEFAULT_WIDGETS,
 };
 use crate::sensors::{NvmlSensors, SensorSource};
 use crate::session::{self, Options, Session, Unlocked};
@@ -207,6 +225,9 @@ pub struct DaemonConfig {
     pub feed: FeedFrameLen,
     /// How often an `E3` goes out.
     pub strategy: FeedStrategy,
+    /// The display mode to set on each connection. `None` leaves the mode alone:
+    /// see the [module docs](self#when-e5-goes-out).
+    pub mode: Option<Mode>,
     /// Stops after this many ticks. Only tests and dry-run set this.
     pub max_ticks: Option<u64>,
 }
@@ -219,6 +240,7 @@ impl Default for DaemonConfig {
             interval_s: 3,
             feed: FeedFrameLen::Full,
             strategy: FeedStrategy::Adaptive,
+            mode: None,
             max_ticks: None,
         }
     }
@@ -245,6 +267,12 @@ impl DaemonConfig {
             None => panel.elements == Elements::NONE,
         };
         needed.then_some(wanted)
+    }
+
+    /// The mode `E5` should select for a panel reporting `panel`, or `None` if it
+    /// should not be sent. A raw mode with no known meaning is another mode.
+    fn mode_for(&self, panel: ModeStatus) -> Option<Mode> {
+        self.mode.filter(|&wanted| panel.mode() != Some(wanted))
     }
 }
 
@@ -288,6 +316,10 @@ impl<S: Sleep> Sleep for UntilStopped<S> {
 /// What a dry-run prints between the `DF` query and `E1`.
 const WOULD_DECIDE: &str =
     "dry-run: read-backs are unavailable, so E1 is shown; a real run decides from DF";
+
+/// What a dry-run prints between the `DE` query and `E5`.
+const WOULD_DECIDE_MODE: &str =
+    "dry-run: read-backs are unavailable, so E5 is shown; a real run decides from DE";
 
 /// What [`run_with`] reaches the outside world through. [`run`] fills this in
 /// with the real ones, and tests with harmless ones.
@@ -749,9 +781,10 @@ where
         }
     }
 
-    /// One pass through the gate, then `DF` and any `E1` of this connection, under
-    /// the gate's lock so that an upload cannot slip in between. A failed `DF`
-    /// returns from here like any other error, so the caller backs off.
+    /// One pass through the gate, then any `DE` and `E5`, then `DF` and any `E1`
+    /// of this connection, under the gate's lock so that an upload cannot slip in
+    /// between. A failed `DE` or `DF` returns from here like any other error, so
+    /// the caller backs off.
     fn connect_once(&mut self) -> Result<Option<Connection<T, W>>> {
         let session = (self.connect)()?;
         // The gate can take seconds, and a shutdown sends nothing.
@@ -773,9 +806,22 @@ where
         }
     }
 
-    /// Reads `DF` and sends `E1` if the panel needs it. `false` if asked to stop.
+    /// Sets the mode if one is configured, then reads `DF` and sends `E1` if the
+    /// panel needs it. `false` if asked to stop.
     fn configure(&self, transport: &mut impl Transport) -> Result<bool> {
         let mut panel = Panel::new(transport);
+        if self.config.mode.is_some() {
+            let status = panel.mode()?;
+            let update = self.config.mode_for(status);
+            log_mode_decision(status, update);
+            // The read took time, and a shutdown sends nothing.
+            if self.stopped() {
+                return Ok(false);
+            }
+            if let Some(wanted) = update {
+                panel.set_mode(wanted)?;
+            }
+        }
         let shown = panel.display()?;
         let update = self.config.update_for(shown);
         log_decision(shown, update);
@@ -792,6 +838,14 @@ where
     /// Shows what [`Self::configure`] might send. There is no reply to decide
     /// from, but a failure to print still ends the run.
     fn preview(&self, dry_run: &mut DryRun<W>) -> Result<()> {
+        if let Some(wanted) = self.config.mode {
+            match Panel::new(&mut *dry_run).mode() {
+                Err(Error::ReadbackUnavailable) => {}
+                other => drop(other?),
+            }
+            dry_run.note(WOULD_DECIDE_MODE)?;
+            Panel::new(&mut *dry_run).set_mode(wanted)?;
+        }
         match Panel::new(&mut *dry_run).display() {
             Err(Error::ReadbackUnavailable) => {}
             other => drop(other?),
@@ -891,6 +945,22 @@ fn log_decision(shown: DisplayStatus, update: Option<DisplayStatus>) {
     }
 }
 
+/// Logs what mode the panel is in and whether `E5` goes out.
+fn log_mode_decision(shown: ModeStatus, update: Option<Mode>) {
+    let raw = shown.raw_mode;
+    let mode = match shown.mode() {
+        Some(mode) => format!("mode {} (raw 0x{raw:02X})", mode.number()),
+        None => format!("unknown mode (raw 0x{raw:02X})"),
+    };
+    match update {
+        Some(wanted) => log::info!(
+            "panel is in {mode}: sending E5 with mode {}",
+            wanted.number()
+        ),
+        None => log::info!("panel is in {mode}: no E5 needed"),
+    }
+}
+
 /// The deadline after `previous`. If that one has passed already it is dropped,
 /// not made up for: see the [module docs](self).
 fn next_deadline(previous: Instant, now: Instant) -> Instant {
@@ -927,7 +997,47 @@ mod tests {
         assert_eq!(config.dashboard().interval_s, 3);
         assert_eq!(config.feed, FeedFrameLen::Full);
         assert_eq!(config.strategy, FeedStrategy::Adaptive);
+        assert_eq!(config.mode, None);
         assert_eq!(config.max_ticks, None);
+    }
+
+    fn in_mode(raw_mode: u8) -> ModeStatus {
+        ModeStatus { raw_mode, on: true }
+    }
+
+    #[test]
+    fn without_a_mode_no_mode_is_ever_set() {
+        let config = DaemonConfig::default();
+
+        for raw in [0x00, 0x01, 0x0A, 0x0B, 0xFF] {
+            assert_eq!(config.mode_for(in_mode(raw)), None, "{raw:02X}");
+        }
+    }
+
+    #[test]
+    fn a_configured_mode_is_set_only_when_the_panel_reports_another() {
+        let config = DaemonConfig {
+            mode: Some(Mode::Faith1),
+            ..DaemonConfig::default()
+        };
+
+        assert_eq!(config.mode_for(in_mode(0x01)), None);
+        assert_eq!(config.mode_for(in_mode(0x0B)), Some(Mode::Faith1));
+        assert_eq!(config.mode_for(in_mode(0x02)), Some(Mode::Faith1));
+        // No known meaning, so it cannot be the mode asked for.
+        assert_eq!(config.mode_for(in_mode(0x09)), Some(Mode::Faith1));
+        assert_eq!(config.mode_for(in_mode(0x00)), Some(Mode::Faith1));
+    }
+
+    #[test]
+    fn the_carousel_matches_either_byte_it_reads_back_as() {
+        let config = DaemonConfig {
+            mode: Some(Mode::Carousel),
+            ..DaemonConfig::default()
+        };
+
+        assert_eq!(config.mode_for(in_mode(0x08)), None);
+        assert_eq!(config.mode_for(in_mode(0x0A)), None);
     }
 
     #[test]
