@@ -4,7 +4,9 @@
 //! The gate takes the lock before it opens a device, so if `--dry-run` ever
 //! stopped short-circuiting, this would fail at the lock and not reach the bus.
 
+use std::fs;
 use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -54,11 +56,24 @@ fn verbose_leaves_stdout_alone() {
     assert_eq!(stdout(&verbose), stdout(&plain));
 }
 
+/// An empty config file, for runs that mean "no config". Without `--config`
+/// the binary reads the machine's `/etc/aorus-lcd.toml`, and the tests would see
+/// whatever is installed there. It lives in cargo's test scratch directory, not
+/// a `TempDir`, because a spawned daemon may read it after this returns. Tests
+/// rewrite it at the same time, but always with nothing.
+fn empty_config() -> PathBuf {
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join("cli_dry_run-empty.toml");
+    fs::write(&path, "").unwrap();
+    path
+}
+
 fn dry_run_daemon(arguments: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_aorus-lcd"));
     command
         .args(["daemon", "--dry-run"])
         .args(arguments)
+        .arg("--config")
+        .arg(empty_config())
         .env(LOCK_PATH_ENV, "/nonexistent/aorus-lcd-test/lock");
     command
 }
