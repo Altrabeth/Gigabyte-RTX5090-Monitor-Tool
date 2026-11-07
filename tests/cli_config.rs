@@ -16,16 +16,20 @@ fn setup_frames(output: &Output) -> String {
     text[..feed + header_end].to_owned()
 }
 
+/// A dry-run with this config file, or with an empty one for `None`. Never
+/// without `--config`: the binary would then read the machine's
+/// `/etc/aorus-lcd.toml`, and the test would see whatever is installed there.
+/// That a missing default file means defaults is a unit test in `config.rs`.
 fn dry_run(config: Option<&Path>, arguments: &[&str]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_aorus-lcd"));
-    command
+    let (_dir, empty) = config_file(b"");
+    Command::new(env!("CARGO_BIN_EXE_aorus-lcd"))
         .args(["daemon", "--dry-run", "--max-ticks", "1"])
         .args(arguments)
-        .env(LOCK_PATH_ENV, "/nonexistent/aorus-lcd-test/lock");
-    if let Some(path) = config {
-        command.arg("--config").arg(path);
-    }
-    command.output().unwrap()
+        .arg("--config")
+        .arg(config.unwrap_or(&empty))
+        .env(LOCK_PATH_ENV, "/nonexistent/aorus-lcd-test/lock")
+        .output()
+        .unwrap()
 }
 
 /// A [`dry_run`] on the steady feed, for tests that need the first `E3`: it reads
@@ -116,17 +120,6 @@ fn the_command_line_beats_the_file() {
     assert_ne!(
         setup_frames(&output),
         setup_frames(&steady_with_config(text, &[]))
-    );
-}
-
-#[test]
-fn an_empty_file_is_the_same_as_no_options() {
-    let output = steady_with_config("# nothing\n", &[]);
-
-    assert!(output.status.success(), "{output:?}");
-    assert_eq!(
-        setup_frames(&output),
-        setup_frames(&steady_dry_run(None, &[]))
     );
 }
 
