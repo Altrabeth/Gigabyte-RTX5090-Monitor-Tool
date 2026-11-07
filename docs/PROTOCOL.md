@@ -209,8 +209,10 @@ eight every 4 s then, and also just before the power loss. So mode and widgets a
   upload never interleave. Non-root users cannot create that file, so `dist/aorus-lcd.tmpfiles` does.
   There is no fallback to another path, which would break mutual exclusion.
 - Refuse to write if the `EB 03` probe fails.
-- The daemon sends only `EB 03`, `DF`, at most one `E1` per connection and `E3`, and nothing on
-  shutdown. It never sends `AA`.
+- The daemon sends only `EB 03`, `DF`, at most 2 `E1` per connection and `E3`, and nothing on
+  shutdown. With a `mode` configured it also reads `DE` and sends at most 3 `E5` per connection,
+  before `DF`. It reads back each `E5` and `E1` 1 s later, and reads `DE` and `DF` once a minute
+  while feeding. It never sends `AA`.
 - Out of scope: `E1` "brightness", `FA` poweroff mode, the `0x76` LcdEx protocol, RGB, fan control.
 
 ## Source layout

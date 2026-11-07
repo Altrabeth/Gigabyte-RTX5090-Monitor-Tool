@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use aorus_lcd::config::{self, Resolved, Settings};
 use aorus_lcd::daemon::{self, DaemonConfig, FeedStrategy};
-use aorus_lcd::protocol::{parse_widgets, Elements, FeedFrameLen};
+use aorus_lcd::protocol::{parse_widgets, Elements, FeedFrameLen, Mode};
 use aorus_lcd::{Error, Result};
 
 /// How long `--dry-run` runs, since nothing else ends it unattended.
@@ -46,6 +46,13 @@ pub struct Args {
     #[arg(long, value_name = "steady|adaptive")]
     pub feed: Option<FeedStrategy>,
 
+    /// Display mode to keep, as for `aorus-lcd mode`: E5 goes out on connect when
+    /// the panel is in another mode, and the mode is read again once a minute, so a
+    /// mode set by hand is switched back. The panel forgets its mode on a power
+    /// loss, and save does not keep it. Without this the mode is left alone
+    #[arg(long, value_name = "0-8", value_parser = parse_mode)]
+    pub mode: Option<Mode>,
+
     /// Stop after N ticks. For tests: it does nothing else
     #[arg(long, value_name = "N", hide = true)]
     pub max_ticks: Option<u64>,
@@ -72,6 +79,7 @@ impl Args {
             feed: self.feed,
             frame_bytes: self.frame_bytes,
             bus,
+            mode: self.mode,
         }
     }
 
@@ -82,6 +90,14 @@ impl Args {
             ..config
         }
     }
+}
+
+/// The number as `aorus-lcd mode` takes it. The range is [`Mode::try_from`]'s.
+fn parse_mode(value: &str) -> Result<Mode> {
+    let number: u8 = value
+        .parse()
+        .map_err(|_| Error::InvalidArgument(format!("display mode must be 0 to 8, not {value}")))?;
+    Mode::try_from(number)
 }
 
 fn parse_frame_bytes(value: &str) -> Result<FeedFrameLen> {
@@ -155,6 +171,39 @@ mod tests {
             let line = ["daemon", "--interval", value];
             assert!(Harness::try_parse_from(line).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn the_mode_reaches_the_config_by_its_cli_number() {
+        assert_eq!(config_parsed_from(&[]).mode, None);
+        assert_eq!(
+            config_parsed_from(&["--mode", "0"]).mode,
+            Some(Mode::Faith1)
+        );
+        assert_eq!(
+            config_parsed_from(&["--mode", "8"]).mode,
+            Some(Mode::PresetRotation)
+        );
+    }
+
+    #[test]
+    fn bad_modes_do_not_parse() {
+        for value in ["9", "-1", "256", "zero", ""] {
+            let line = ["daemon", "--mode", value];
+            assert!(Harness::try_parse_from(line).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn the_mode_on_the_command_line_beats_the_file() {
+        let file = config::parse("mode = 8\n", "test.toml".as_ref()).unwrap();
+        let args = Harness::try_parse_from(["daemon", "--mode", "0"])
+            .unwrap()
+            .args;
+
+        let resolved = config::resolve(args.settings(None), &file).unwrap();
+
+        assert_eq!(resolved.daemon.mode, Some(Mode::Faith1));
     }
 
     #[test]

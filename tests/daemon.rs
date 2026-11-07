@@ -19,14 +19,15 @@ use aorus_lcd::bus::lock::BusLock;
 use aorus_lcd::bus::transport::{DryRun, Transport};
 use aorus_lcd::daemon::{
     run_with, Clock, DaemonConfig, Environment, FeedStrategy, UntilStopped, ADAPTIVE_BUSY_PERCENT,
-    ADAPTIVE_PAIR_GAP_TICKS, ADAPTIVE_WINDOW_POLLS, POLL_SLICE, WRITE_ATTEMPTS,
-    WRITE_COST_REPORT_TICKS,
+    ADAPTIVE_PAIR_GAP_TICKS, ADAPTIVE_WINDOW_POLLS, CHECK_PERIOD, DASHBOARD_ATTEMPTS,
+    MODE_ATTEMPTS, POLL_SLICE, SETTLE, WRITE_ATTEMPTS, WRITE_COST_REPORT_TICKS,
 };
 use aorus_lcd::panel::Sleep;
 use aorus_lcd::protocol::{
-    display_frame, display_query_frame, probe_frame, sensor_frame, DisplayStatus, Elements,
-    FeedFrameLen, SensorSample, OP_GET_DISPLAY, OP_GET_IMAGE_TPL, OP_SAVE, OP_SENSOR_FEED,
-    OP_SET_DISPLAY, PROBE_READ_LEN,
+    display_frame, display_query_frame, mode_frame, mode_query_frame, probe_frame, sensor_frame,
+    DisplayStatus, Elements, FeedFrameLen, Mode, ModeStatus, SensorSample, OP_GET_DISPLAY,
+    OP_GET_IMAGE_TPL, OP_GET_MODE, OP_SAVE, OP_SENSOR_FEED, OP_SET_DISPLAY, OP_SET_MODE,
+    PROBE_READ_LEN,
 };
 use aorus_lcd::sensors::{FakeSensors, SensorSource};
 use aorus_lcd::session::{self, connect_with, Options, Session};
@@ -42,6 +43,13 @@ const READ_BACK: u8 = OP_GET_DISPLAY;
 const DASHBOARD: u8 = OP_SET_DISPLAY;
 const FEED: u8 = OP_SENSOR_FEED;
 const SAVE: u8 = OP_SAVE;
+const MODE_QUERY: u8 = OP_GET_MODE;
+const SET_MODE: u8 = OP_SET_MODE;
+/// The raw `DE` byte of mode 8, the preset rotation, which the real panel read
+/// after a power loss.
+const RAW_PRESET_ROTATION: u8 = 0x0B;
+/// The raw `DE` byte of mode 0.
+const RAW_STATS: u8 = 0x01;
 /// Far past anything a test expects, so a loop that never ends fails.
 const TIME_LIMIT_MS: u64 = 3_600_000;
 
@@ -141,6 +149,8 @@ struct Sent {
     locked: bool,
     /// What `DF` reported at the time of the write.
     panel: DisplayStatus,
+    /// The raw mode `DE` reported at the time of the write.
+    mode: u8,
 }
 
 impl Sent {
@@ -187,10 +197,17 @@ struct DeviceState {
     trace: RefCell<Vec<Sent>>,
     faults: RefCell<Vec<Fault>>,
     read_faults: RefCell<Vec<Fault>>,
-    /// The widget mask and interval. A panel with no widgets unless set.
+    /// The widget mask and interval.
     panel: Cell<(u8, u8)>,
+    /// The raw mode byte `DE` reports, which `E5` sets.
+    mode: Cell<u8>,
     /// `E1` goes unnoticed, as if the controller had lost it right away.
     forgets_e1: Cell<bool>,
+    /// How many more `E1` go unnoticed, after which they are taken.
+    ignores_e1: Cell<u32>,
+    /// How many more `E5` go unnoticed. `u32::MAX` for a panel that never
+    /// takes one.
+    ignores_e5: Cell<u32>,
     no_answer_until: Cell<u64>,
     missing_until: Cell<u64>,
     refuse_open_from: Cell<Option<u64>>,
@@ -240,9 +257,19 @@ impl Transport for Device {
             ok: fault.is_none(),
             locked,
             panel: panel_status(self.state.panel.get()),
+            mode: self.state.mode.get(),
         });
-        if fault.is_none() && frame[0] == DASHBOARD && !self.state.forgets_e1.get() {
+        let forgets_e1 = self.state.forgets_e1.get();
+        if fault.is_none()
+            && frame[0] == DASHBOARD
+            && !forgets_e1
+            && !ignored(&self.state.ignores_e1)
+        {
             self.store_dashboard(frame);
+        }
+        // `E5` carries the wire byte, which is also what `DE` reads back.
+        if fault.is_none() && frame[0] == SET_MODE && !ignored(&self.state.ignores_e5) {
+            self.state.mode.set(frame[5]);
         }
         let outcome = fault.map_or(Ok(()), |fault| Err((fault.error)()));
         drop(faults);
@@ -265,8 +292,20 @@ impl Transport for Device {
             let (mask, interval) = self.state.panel.get();
             buf.copy_from_slice(&[READ_BACK, mask, interval, 0]);
         }
+        if query.opcode() == MODE_QUERY {
+            buf.copy_from_slice(&[MODE_QUERY, self.state.mode.get(), 1, 0]);
+        }
         Ok(())
     }
+}
+
+/// Whether a frame goes unnoticed, using up one of `count`.
+fn ignored(count: &Cell<u32>) -> bool {
+    let left = count.get();
+    if left > 0 && left != u32::MAX {
+        count.set(left - 1);
+    }
+    left > 0
 }
 
 fn panel_status((mask, interval_s): (u8, u8)) -> DisplayStatus {
@@ -276,8 +315,14 @@ fn panel_status((mask, interval_s): (u8, u8)) -> DisplayStatus {
     }
 }
 
+/// The widgets and interval that `E1` sends when the config names none.
+const DEFAULT_MASK: u8 = 0xAF;
+const DEFAULT_INTERVAL: u8 = 3;
+
 /// A temporary sysfs tree and lock path, and the fake device and time around
-/// one run of the daemon.
+/// one run of the daemon. Its panel shows the default widgets, so the connect
+/// steps send no `E1` and cost no settle unless a test empties it with
+/// [`Rig::panel_has`].
 struct Rig {
     dir: TempDir,
     clock: FakeClock,
@@ -299,14 +344,16 @@ impl Rig {
     fn without_adapter() -> Self {
         let dir = TempDir::new().unwrap();
         fs::create_dir(dir.path().join("run")).unwrap();
-        Self {
+        let rig = Self {
             dir,
             clock: FakeClock::new(),
             stop: Arc::default(),
             device: Rc::default(),
             upload: Rc::default(),
             bus: Cell::default(),
-        }
+        };
+        rig.panel_has(DEFAULT_MASK, DEFAULT_INTERVAL);
+        rig
     }
 
     fn sysfs_root(&self) -> PathBuf {
@@ -340,6 +387,11 @@ impl Rig {
             opcode: Some(opcode),
             error,
         });
+    }
+
+    /// The raw mode `DE` reports from now on.
+    fn panel_in_mode(&self, raw: u8) {
+        self.device.mode.set(raw);
     }
 
     /// What `DF` reports from now on.
@@ -530,13 +582,46 @@ fn assert_only_allowed_frames(trace: &[Sent]) {
     assert_allowed_frames(trace, DaemonConfig::default());
 }
 
+/// `prev`, if it is a frame of `opcode` that went out.
+fn after(prev: Option<&Sent>, opcode: u8) -> Option<&Sent> {
+    prev.filter(|sent| sent.ok && sent.opcode() == opcode)
+}
+
+/// Where one connection is, for [`assert_allowed_frames`].
+#[derive(Default)]
+struct Setup {
+    e5s: u32,
+    e1s: u32,
+    /// When the connect steps ended, so `E3` and the check may follow.
+    configured_at: Option<u64>,
+    /// The earliest time the next check may read.
+    check_from: u64,
+    /// The check read a `DE` that needs nothing, so its `DF` comes next.
+    mode_checked: bool,
+    /// The check found the panel needing a new setup, so only a probe may follow.
+    stale: bool,
+}
+
 /// The rules of the wire, over a whole trace. Failed attempts count: a frame that
 /// reached the controller partly is still a frame sent.
 ///
-/// Every frame is `EB 03`, `DF`, the configured `E1`, or `E3`, all under the
-/// lock. Each `DF` directly follows a probe that went out. An `E1` directly
-/// follows a `DF` that got an answer, so there is at most one per connection, and
-/// only if that answer calls for it. `E3` needs that answer and any such `E1`.
+/// Every frame is `EB 03`, `DE`, the configured `E5`, `DF`, the configured `E1`,
+/// or `E3`, all under the lock. Per connection, in order:
+///
+/// - With a mode configured, a `DE` directly after a probe that went out. Each
+///   `E5` directly follows an answered `DE` that calls for it, and each `E5` that
+///   went out is followed by a `DE` at least [`SETTLE`] later. At most
+///   [`MODE_ATTEMPTS`] `E5`. `DF` follows a `DE` that needs no `E5`, or the one
+///   after the last `E5`. Without a mode, no `DE` or `E5`, and `DF` directly
+///   follows the probe.
+/// - The first `E1` directly follows an answered `DF` that calls for it, and
+///   each `E1` that went out is followed by a `DF` at least [`SETTLE`] later. A
+///   second `E1` only if that `DF` differs from what was sent. At most
+///   [`DASHBOARD_ATTEMPTS`].
+/// - `E3` only once that is done.
+/// - Then the check: no sooner than [`CHECK_PERIOD`] after the setup and after
+///   the last check, a `DE` if a mode is configured and then a `DF`. If either
+///   calls for a new setup, nothing but a probe follows.
 fn assert_allowed_frames(trace: &[Sent], config: DaemonConfig) {
     let wanted = config.dashboard();
     let dashboard = display_frame(wanted.elements, wanted.interval_s);
@@ -544,40 +629,111 @@ fn assert_allowed_frames(trace: &[Sent], config: DaemonConfig) {
         Some(_) => panel != wanted,
         None => panel.elements == Elements::NONE,
     };
-    let mut probed = false;
-    let mut read_back = None;
-    let mut configured = false;
+    let needs_e5 = |raw_mode: u8| ModeStatus { raw_mode, on: true }.mode() != config.mode;
+    let period = CHECK_PERIOD.as_millis() as u64;
+    let settle = SETTLE.as_millis() as u64;
+    let mut setup = Setup::default();
+    let mut prev: Option<&Sent> = None;
     for sent in trace {
+        if sent.opcode() != PROBE {
+            assert!(!setup.stale, "after a failed check, only a probe: {sent:?}");
+        }
         match sent.opcode() {
             PROBE => {
                 assert_eq!(sent.frame[..], probe_frame()[..], "not EB 03");
-                probed = sent.ok;
-                read_back = None;
-                configured = false;
+                setup = Setup::default();
+            }
+            MODE_QUERY => {
+                assert!(
+                    config.mode.is_some(),
+                    "DE with no mode configured: {sent:?}"
+                );
+                assert_eq!(sent.frame[..], mode_query_frame()[..], "not DE");
+                if setup.configured_at.is_none() {
+                    let first = after(prev, PROBE).is_some();
+                    let verify = after(prev, SET_MODE).is_some_and(|e5| sent.at - e5.at >= settle);
+                    assert!(
+                        first || verify,
+                        "DE neither after the probe nor a settle after E5: {sent:?}"
+                    );
+                } else {
+                    assert!(sent.at >= setup.check_from, "a check too soon: {sent:?}");
+                    if sent.ok {
+                        setup.stale = needs_e5(sent.mode);
+                        setup.mode_checked = !setup.stale;
+                    }
+                }
+            }
+            SET_MODE => {
+                let mode = config.mode.expect("E5 with no mode configured");
+                assert_eq!(sent.frame[..], mode_frame(mode)[..], "an unexpected E5");
+                assert!(setup.configured_at.is_none(), "E5 after setup: {sent:?}");
+                let read = after(prev, MODE_QUERY).expect("E5 without an answered DE before it");
+                assert!(needs_e5(read.mode), "E5 for a panel in that mode: {sent:?}");
+                setup.e5s += 1;
+                assert!(setup.e5s <= MODE_ATTEMPTS, "too many E5: {sent:?}");
             }
             READ_BACK => {
                 assert_eq!(sent.frame[..], display_query_frame()[..], "not DF");
-                assert!(probed, "DF without a probe just before it: {sent:?}");
-                probed = false;
-                read_back = sent.ok.then_some(sent.panel);
-                configured = sent.ok && !needs_e1(sent.panel);
+                if setup.configured_at.is_none() {
+                    let mode_settled = match config.mode {
+                        None => after(prev, PROBE).is_some(),
+                        Some(_) => after(prev, MODE_QUERY)
+                            .is_some_and(|de| !needs_e5(de.mode) || setup.e5s == MODE_ATTEMPTS),
+                    };
+                    let verify = after(prev, DASHBOARD).is_some_and(|e1| sent.at - e1.at >= settle);
+                    assert!(
+                        mode_settled || verify,
+                        "DF neither after a settled mode nor a settle after E1: {sent:?}"
+                    );
+                    let done = if verify {
+                        sent.panel == wanted || setup.e1s == DASHBOARD_ATTEMPTS
+                    } else {
+                        !needs_e1(sent.panel)
+                    };
+                    if sent.ok && done {
+                        setup.configured_at = Some(sent.at);
+                        setup.check_from = sent.at + period;
+                    }
+                } else {
+                    let due = match config.mode {
+                        None => sent.at >= setup.check_from,
+                        Some(_) => setup.mode_checked && after(prev, MODE_QUERY).is_some(),
+                    };
+                    assert!(due, "a check DF out of turn: {sent:?}");
+                    setup.mode_checked = false;
+                    if sent.ok {
+                        setup.stale = needs_e1(sent.panel);
+                        setup.check_from += period;
+                    }
+                }
             }
             DASHBOARD => {
                 assert_eq!(sent.frame[..], dashboard[..], "an unexpected E1");
-                let panel = read_back.take();
-                let panel = panel.expect("E1 without an answered DF just before it");
-                assert!(needs_e1(panel), "E1 for a panel that needs none: {sent:?}");
-                configured = sent.ok;
+                assert!(setup.configured_at.is_none(), "E1 after setup: {sent:?}");
+                let read = after(prev, READ_BACK).expect("E1 without an answered DF before it");
+                let needed = if setup.e1s == 0 {
+                    needs_e1(read.panel)
+                } else {
+                    read.panel != wanted
+                };
+                assert!(needed, "E1 for a panel that needs none: {sent:?}");
+                setup.e1s += 1;
+                assert!(setup.e1s <= DASHBOARD_ATTEMPTS, "too many E1: {sent:?}");
             }
             FEED => {
                 assert_eq!(sent.frame.len(), config.feed.bytes());
-                assert!(configured, "E3 before the panel was ready: {sent:?}");
-                read_back = None;
+                assert!(
+                    setup.configured_at.is_some(),
+                    "E3 before the panel was ready: {sent:?}"
+                );
+                assert!(!setup.mode_checked, "E3 inside a check: {sent:?}");
             }
             SAVE => panic!("AA must never be sent: {sent:?}"),
             other => panic!("the daemon must not send {other:02X}: {sent:?}"),
         }
         assert!(sent.locked, "written without the lock: {sent:?}");
+        prev = Some(sent);
     }
 }
 
@@ -595,22 +751,25 @@ impl<G: FnMut() -> Result<SensorSample>> SensorSource for ScriptedSensors<G> {
 #[test]
 fn a_panel_with_no_widgets_gets_probe_then_read_back_then_dashboard_then_feed() {
     let rig = Rig::new();
+    rig.panel_has(0, 0);
 
     rig.ticks(3).unwrap();
 
     let trace = rig.trace();
     assert_eq!(
         rig.opcodes(),
-        [PROBE, READ_BACK, DASHBOARD, FEED, FEED, FEED]
+        [PROBE, READ_BACK, DASHBOARD, READ_BACK, FEED, FEED, FEED]
     );
-    assert_eq!(rig.delivered(FEED), [0, 1000, 2000]);
+    // The E1 is read back after it has settled, and the feed starts then.
+    assert_eq!(rig.attempts(READ_BACK), [0, 1000]);
+    assert_eq!(rig.delivered(FEED), [1000, 2000, 3000]);
     assert_eq!(
         trace[2].frame[..],
         display_frame(Elements::from_bits(0xAF), 3)[..]
     );
     assert_eq!(rig.device.panel.get(), (0xAF, 3));
     assert_eq!(
-        trace[3].frame[..],
+        trace[4].frame[..],
         sensor_frame(&SAMPLE, FeedFrameLen::Full)[..]
     );
     assert_only_allowed_frames(&trace);
@@ -649,7 +808,10 @@ fn a_panel_with_other_widgets_gets_one_e1_with_the_named_ones() {
 
     rig.run_configured(config, healthy).unwrap();
 
-    assert_eq!(rig.opcodes(), [PROBE, READ_BACK, DASHBOARD, FEED, FEED]);
+    assert_eq!(
+        rig.opcodes(),
+        [PROBE, READ_BACK, DASHBOARD, READ_BACK, FEED, FEED]
+    );
     assert_eq!(rig.device.panel.get(), (0x05, 7));
     assert_allowed_frames(&rig.trace(), config);
 }
@@ -662,7 +824,10 @@ fn a_panel_with_another_interval_gets_one_e1_with_the_named_one() {
 
     rig.run_configured(config, healthy).unwrap();
 
-    assert_eq!(rig.opcodes(), [PROBE, READ_BACK, DASHBOARD, FEED, FEED]);
+    assert_eq!(
+        rig.opcodes(),
+        [PROBE, READ_BACK, DASHBOARD, READ_BACK, FEED, FEED]
+    );
     assert_eq!(rig.device.panel.get(), (0x05, 7));
     assert_allowed_frames(&rig.trace(), config);
 }
@@ -684,13 +849,14 @@ fn with_no_named_widgets_a_panel_with_widgets_is_left_alone() {
 /// A read-back that fails until 7 seconds in sends no `E1` until then, and costs
 /// the normal backoff.
 fn assert_backs_off_without_e1(rig: &Rig) {
+    rig.panel_has(0, 0);
+
     rig.ticks(1).unwrap();
 
-    let connections = [0, 2000, 6000, 14_000];
-    assert_eq!(rig.attempts(PROBE), connections);
-    assert_eq!(rig.attempts(READ_BACK), connections);
+    assert_eq!(rig.attempts(PROBE), [0, 2000, 6000, 14_000]);
+    assert_eq!(rig.attempts(READ_BACK), [0, 2000, 6000, 14_000, 15_000]);
     assert_eq!(rig.attempts(DASHBOARD), [14_000]);
-    assert_eq!(rig.delivered(FEED), [14_000]);
+    assert_eq!(rig.delivered(FEED), [15_000]);
     assert_only_allowed_frames(&rig.trace());
 }
 
@@ -750,11 +916,12 @@ fn a_permission_error_on_the_read_back_is_fatal() {
 #[test]
 fn a_reconnect_reads_back_again_and_a_panel_that_kept_its_widgets_gets_no_e1() {
     let rig = Rig::new();
-    rig.outage(500, 3500);
+    rig.panel_has(0, 0);
+    rig.outage(1500, 4500);
 
     rig.ticks(5).unwrap();
 
-    assert_eq!(rig.attempts(READ_BACK), [0, 5000]);
+    assert_eq!(rig.attempts(READ_BACK), [0, 1000, 6000]);
     assert_eq!(rig.attempts(DASHBOARD), [0]);
     assert_only_allowed_frames(&rig.trace());
 }
@@ -769,7 +936,7 @@ fn a_reconnect_reads_back_again_and_a_panel_that_lost_its_widgets_gets_e1() {
 
     rig.ticks(5).unwrap();
 
-    assert_eq!(rig.attempts(READ_BACK), [0, 5000]);
+    assert_eq!(rig.attempts(READ_BACK), [0, 5000, 6000]);
     assert_eq!(rig.attempts(DASHBOARD), [5000]);
     assert_only_allowed_frames(&rig.trace());
 }
@@ -796,6 +963,206 @@ fn the_feed_length_comes_from_the_config() {
     .unwrap();
 
     assert_eq!(rig.feed_frames()[0].len(), 128);
+}
+
+/// Mode 0 for `ticks` ticks.
+fn in_mode_0(ticks: Option<u64>) -> DaemonConfig {
+    DaemonConfig {
+        mode: Some(Mode::Faith1),
+        max_ticks: ticks,
+        ..steady()
+    }
+}
+
+#[test]
+fn without_a_mode_the_mode_is_neither_read_nor_set() {
+    let rig = Rig::new();
+    rig.panel_has(0xFF, 4);
+    rig.panel_in_mode(RAW_PRESET_ROTATION);
+
+    rig.ticks(2).unwrap();
+
+    assert_eq!(rig.opcodes(), [PROBE, READ_BACK, FEED, FEED]);
+    assert_eq!(rig.device.mode.get(), RAW_PRESET_ROTATION);
+    assert_only_allowed_frames(&rig.trace());
+}
+
+#[test]
+fn a_panel_already_in_the_mode_gets_no_e5() {
+    let rig = Rig::new();
+    rig.panel_has(0xFF, 4);
+    rig.panel_in_mode(RAW_STATS);
+    let config = in_mode_0(Some(2));
+
+    rig.run_configured(config, healthy).unwrap();
+
+    assert_eq!(rig.opcodes(), [PROBE, MODE_QUERY, READ_BACK, FEED, FEED]);
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+// Seen on the real panel after a power loss: mode 8, and no widgets every 0 s.
+#[test]
+fn a_panel_in_another_mode_gets_one_e5_before_df_and_e1() {
+    let rig = Rig::new();
+    rig.panel_has(0x00, 0);
+    rig.panel_in_mode(RAW_PRESET_ROTATION);
+    let config = in_mode_0(Some(2));
+
+    rig.run_configured(config, healthy).unwrap();
+
+    assert_eq!(
+        rig.opcodes(),
+        [PROBE, MODE_QUERY, SET_MODE, MODE_QUERY, READ_BACK, DASHBOARD, READ_BACK, FEED, FEED]
+    );
+    assert_eq!(rig.trace()[2].frame[..], mode_frame(Mode::Faith1)[..]);
+    assert_eq!(rig.attempts(MODE_QUERY), [0, 1000]);
+    assert_eq!(rig.attempts(READ_BACK), [1000, 2000]);
+    assert_eq!(rig.delivered(FEED), [2000, 3000]);
+    assert_eq!(rig.device.mode.get(), RAW_STATS);
+    assert_eq!(rig.device.panel.get(), (0xAF, 3));
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+#[test]
+fn the_preset_rotation_can_be_the_mode_asked_for() {
+    let rig = Rig::new();
+    rig.panel_has(0xFF, 4);
+    rig.panel_in_mode(RAW_STATS);
+    let config = DaemonConfig {
+        mode: Some(Mode::PresetRotation),
+        ..in_mode_0(Some(1))
+    };
+
+    rig.run_configured(config, healthy).unwrap();
+
+    assert_eq!(rig.attempts(SET_MODE), [0]);
+    assert_eq!(rig.device.mode.get(), RAW_PRESET_ROTATION);
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+/// A mode read that fails until 7 seconds in sends nothing past it until then,
+/// and costs the normal backoff.
+fn assert_backs_off_without_e5(rig: &Rig) {
+    let config = in_mode_0(Some(1));
+
+    rig.run_configured(config, healthy).unwrap();
+
+    assert_eq!(rig.attempts(PROBE), [0, 2000, 6000, 14_000]);
+    assert_eq!(rig.attempts(MODE_QUERY), [0, 2000, 6000, 14_000, 15_000]);
+    assert_eq!(rig.attempts(SET_MODE), [14_000]);
+    assert_eq!(rig.attempts(READ_BACK), [15_000]);
+    assert_eq!(rig.delivered(FEED), [15_000]);
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+/// A panel with widgets, in mode 8.
+fn after_power_loss_with_widgets() -> Rig {
+    let rig = Rig::new();
+    rig.panel_has(0xFF, 4);
+    rig.panel_in_mode(RAW_PRESET_ROTATION);
+    rig
+}
+
+#[test]
+fn an_i2c_error_on_the_mode_read_sends_nothing_more_and_backs_off() {
+    let rig = after_power_loss_with_widgets();
+    rig.read_fault(0, 7000, MODE_QUERY, eio);
+
+    assert_backs_off_without_e5(&rig);
+}
+
+#[test]
+fn a_short_mode_read_sends_nothing_more_and_backs_off() {
+    let rig = after_power_loss_with_widgets();
+    rig.read_fault(0, 7000, MODE_QUERY, short_read);
+
+    assert_backs_off_without_e5(&rig);
+}
+
+#[test]
+fn a_failed_de_query_sends_nothing_more_and_backs_off() {
+    let rig = after_power_loss_with_widgets();
+    rig.fault(0, 7000, Some(MODE_QUERY), eio);
+
+    assert_backs_off_without_e5(&rig);
+}
+
+#[test]
+fn a_failed_e5_fails_the_connection_before_df() {
+    let rig = after_power_loss_with_widgets();
+    rig.fault(0, 1000, Some(SET_MODE), eio);
+    let config = in_mode_0(Some(1));
+
+    rig.run_configured(config, healthy).unwrap();
+
+    assert_eq!(rig.attempts(SET_MODE), [0, 2000]);
+    assert_eq!(rig.attempts(READ_BACK), [3000]);
+    assert_eq!(rig.delivered(FEED), [3000]);
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+#[test]
+fn a_permission_error_on_the_mode_read_is_fatal() {
+    let rig = Rig::new();
+    rig.read_fault(0, TIME_LIMIT_MS, MODE_QUERY, || errno_error(Errno::ACCESS));
+
+    let error = rig.run_configured(in_mode_0(None), no_sensors).unwrap_err();
+
+    assert!(matches!(error, Error::I2c { .. }), "{error:?}");
+    assert_eq!(rig.attempts(SET_MODE), []);
+    assert_eq!(rig.attempts(READ_BACK), []);
+}
+
+#[test]
+fn a_reconnect_reads_the_mode_again_and_sets_it_only_if_it_changed() {
+    let rig = Rig::new();
+    rig.panel_has(0xFF, 4);
+    rig.panel_in_mode(RAW_STATS);
+    rig.outage(500, 3500);
+    rig.outage(5500, 8500);
+    // A manual `mode 5` while the second connection runs.
+    let device = rig.device.clone();
+    rig.clock.at(5200, move || device.mode.set(0x06));
+    let config = in_mode_0(Some(9));
+
+    rig.run_configured(config, healthy).unwrap();
+
+    assert_eq!(rig.attempts(MODE_QUERY), [0, 5000, 10_000, 11_000]);
+    assert_eq!(rig.attempts(SET_MODE), [10_000]);
+    assert_eq!(rig.device.mode.get(), RAW_STATS);
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+#[test]
+fn shutdown_during_the_mode_read_does_not_go_on_to_e5() {
+    let rig = after_power_loss_with_widgets();
+    rig.device.write_cost.set(ms(10));
+    rig.stop_at(15);
+
+    rig.run_configured(in_mode_0(None), healthy).unwrap();
+
+    assert_eq!(rig.opcodes(), [PROBE, MODE_QUERY]);
+}
+
+#[test]
+fn no_forbidden_frame_when_the_mode_is_set_on_each_connection() {
+    let rig = after_power_loss_with_widgets();
+    rig.read_fault(49_500, 50_500, MODE_QUERY, short_read);
+    // Lost again while the feed is failing, so a later connection needs E5 too.
+    let device = rig.device.clone();
+    rig.clock
+        .at(22_000, move || device.mode.set(RAW_PRESET_ROTATION));
+
+    run_through_everything(&rig, in_mode_0(None));
+
+    let trace = rig.trace();
+    assert_eq!(rig.delivered(SET_MODE).len(), 2, "{trace:?}");
+    let (asked, answered) = (rig.attempts(MODE_QUERY), rig.delivered(MODE_QUERY));
+    assert!(
+        answered.len() < asked.len(),
+        "the failed DE was not hit: {asked:?}"
+    );
+    assert_eq!(rig.attempts(DASHBOARD), []);
 }
 
 #[test]
@@ -867,7 +1234,6 @@ fn a_busy_lock_skips_ticks_without_waiting_or_backing_off() {
 
     assert_eq!(rig.delivered(FEED), [0, 1000, 2000, 6000, 7000]);
     assert_eq!(rig.attempts(PROBE), [0], "skipping must not reconnect");
-    assert_eq!(rig.attempts(DASHBOARD), [0]);
     assert_only_allowed_frames(&rig.trace());
 }
 
@@ -927,7 +1293,6 @@ fn a_transient_failure_is_retried_on_the_next_tick_without_reconnecting() {
     assert_eq!(rig.attempts(FEED), [0, 1000, 2000, 3000, 4000]);
     assert_eq!(rig.delivered(FEED), [0, 1000, 3000, 4000]);
     assert_eq!(rig.attempts(PROBE), [0]);
-    assert_eq!(rig.attempts(DASHBOARD), [0]);
 }
 
 #[test]
@@ -944,24 +1309,29 @@ fn a_good_write_clears_the_count_of_failures() {
 }
 
 #[test]
-fn reconnect_backs_off_sends_e1_once_and_resets_after_a_good_write() {
+fn reconnect_backs_off_sends_e1_twice_per_connection_and_resets_after_a_good_write() {
     let rig = Rig::new();
+    rig.panel_has(0, 0);
     rig.device.forgets_e1.set(true);
     rig.outage(2500, 20_000);
-    rig.outage(36_500, 39_500);
+    rig.outage(40_500, 43_500);
 
     rig.ticks(14).unwrap();
 
-    // Three failed ticks, then waits of 2, 4, 8 and 16 seconds. The second outage
-    // starts over at 2 seconds.
+    // Each connection: two E1 a settle apart, then a DF a settle later, and the
+    // feed. Three failed ticks, then waits of 2, 4, 8 and 16 seconds. The second
+    // outage starts over at 2 seconds.
     assert_eq!(
         rig.attempts(PROBE),
-        [0, 7000, 11_000, 19_000, 35_000, 41_000]
+        [0, 7000, 11_000, 19_000, 35_000, 45_000]
     );
-    assert_eq!(rig.attempts(DASHBOARD), [0, 35_000, 41_000]);
+    assert_eq!(
+        rig.attempts(DASHBOARD),
+        [0, 1000, 35_000, 36_000, 45_000, 46_000]
+    );
     assert_eq!(
         rig.delivered(FEED),
-        [0, 1000, 2000, 35_000, 36_000, 41_000, 42_000, 43_000]
+        [2000, 37_000, 38_000, 39_000, 40_000, 47_000, 48_000, 49_000]
     );
     assert_only_allowed_frames(&rig.trace());
 }
@@ -974,7 +1344,7 @@ fn a_controller_that_stops_answering_is_retried_through_the_probe() {
     rig.ticks(2).unwrap();
 
     assert_eq!(rig.attempts(PROBE), [0, 2000, 6000, 14_000, 30_000]);
-    assert_eq!(rig.attempts(DASHBOARD), [30_000]);
+    assert_eq!(rig.attempts(READ_BACK), [30_000]);
 }
 
 #[test]
@@ -991,6 +1361,7 @@ fn a_short_read_counts_as_a_bus_error() {
 #[test]
 fn a_failed_e1_is_not_repeated_on_the_same_connection() {
     let rig = Rig::new();
+    rig.panel_has(0, 0);
     rig.fault(0, 1000, Some(DASHBOARD), eio);
 
     rig.ticks(2).unwrap();
@@ -1006,12 +1377,15 @@ fn a_failed_e1_is_not_repeated_on_the_same_connection() {
 #[test]
 fn e1_does_not_count_as_a_good_write() {
     let rig = Rig::new();
+    rig.panel_has(0, 0);
     rig.device.forgets_e1.set(true);
     rig.fault(500, TIME_LIMIT_MS, Some(FEED), eio);
 
     rig.ticks(15).unwrap();
 
-    assert_eq!(rig.delivered(DASHBOARD), [0, 5000, 11_000, 21_000, 39_000]);
+    // Each connection takes two settles, then three failed ticks.
+    assert_eq!(rig.attempts(PROBE), [0, 6000, 14_000, 26_000, 46_000]);
+    assert_eq!(rig.delivered(DASHBOARD).len(), 10);
     assert_only_allowed_frames(&rig.trace());
 }
 
@@ -1096,7 +1470,7 @@ fn startup_backs_off_to_the_cap_while_the_controller_stays_silent() {
         rig.attempts(PROBE),
         [0, 2000, 6000, 14_000, 30_000, 62_000, 122_000, 182_000]
     );
-    assert_eq!(rig.attempts(DASHBOARD), [182_000]);
+    assert_eq!(rig.attempts(READ_BACK), [182_000]);
 }
 
 #[test]
@@ -1468,6 +1842,7 @@ fn no_forbidden_frame_when_the_panel_matches_the_named_widgets() {
 #[test]
 fn no_forbidden_frame_when_e1_is_needed_once() {
     let rig = Rig::new();
+    rig.panel_has(0, 0);
 
     run_through_everything(&rig, steady());
 
@@ -1477,17 +1852,39 @@ fn no_forbidden_frame_when_e1_is_needed_once() {
 #[test]
 fn no_forbidden_frame_when_each_connection_needs_e1() {
     let rig = Rig::new();
+    rig.panel_has(0, 0);
     rig.device.forgets_e1.set(true);
+    // The second E1 of one connection.
+    rig.fault(33_900, 34_100, Some(DASHBOARD), eio);
 
     run_through_everything(&rig, steady());
 
-    let trace = rig.trace();
-    let answered = rig.delivered(READ_BACK).len();
-    assert_eq!(rig.attempts(DASHBOARD).len(), answered, "{trace:?}");
+    assert_each_connection_tried_e1_twice(&rig);
     assert!(
-        rig.delivered(DASHBOARD).len() < answered,
-        "the failed E1 was not hit: {trace:?}"
+        rig.delivered(DASHBOARD).len() < rig.attempts(DASHBOARD).len(),
+        "the failed E1 was not hit: {:?}",
+        rig.attempts(DASHBOARD)
     );
+}
+
+/// For a panel that forgets `E1`: every connection that got as far as feeding
+/// sent two, a settle apart.
+fn assert_each_connection_tried_e1_twice(rig: &Rig) {
+    let trace = rig.trace();
+    let connections = trace.split(|sent| sent.opcode() == PROBE);
+    let fed = connections.filter(|frames| frames.iter().any(|sent| sent.opcode() == FEED));
+    let mut count = 0;
+    for frames in fed {
+        let e1: Vec<u64> = frames
+            .iter()
+            .filter(|sent| sent.opcode() == DASHBOARD)
+            .map(|sent| sent.at)
+            .collect();
+        assert_eq!(e1.len(), 2, "{frames:?}");
+        assert!(e1[1] - e1[0] >= 1000, "{e1:?}");
+        count += 1;
+    }
+    assert!(count >= 2, "{trace:?}");
 }
 
 const BOTH_LENGTHS: [FeedFrameLen; 2] = [FeedFrameLen::Full, FeedFrameLen::Truncated];
@@ -1915,6 +2312,7 @@ fn no_forbidden_frame_in_adaptive_under_load_at_either_length() {
 fn no_forbidden_frame_in_adaptive_under_the_threshold_at_either_length() {
     for feed in BOTH_LENGTHS {
         let rig = Rig::new();
+        rig.panel_has(0, 0);
 
         run_through_everything_at(&rig, adaptive(None, feed), at_usage(20), 4, 100);
 
@@ -1927,6 +2325,7 @@ fn no_forbidden_frame_in_adaptive_under_the_threshold_at_either_length() {
 #[test]
 fn no_forbidden_frame_in_adaptive_with_a_swinging_load_and_e1_on_each_connection() {
     let rig = Rig::new();
+    rig.panel_has(0, 0);
     rig.device.forgets_e1.set(true);
     rig.outage(3500, 9000);
     rig.fault(20_500, 30_500, Some(FEED), eio);
@@ -1946,9 +2345,7 @@ fn no_forbidden_frame_in_adaptive_with_a_swinging_load_and_e1_on_each_connection
     run_on(&rig, config, &polls);
 
     assert_allowed_frames(&rig.trace(), config);
-    let answered = rig.delivered(READ_BACK).len();
-    assert_eq!(rig.attempts(DASHBOARD).len(), answered);
-    assert!(answered >= 2, "{:?}", rig.trace());
+    assert_each_connection_tried_e1_twice(&rig);
     let feed = rig.delivered(FEED);
     assert!(
         feed.windows(2).all(|pair| pair[1] - pair[0] >= 1000),
@@ -2111,6 +2508,356 @@ fn a_skipped_tick_costs_no_write_and_a_period_without_writes_reports_nothing() {
         write_cost_lines(),
         ["E3 write cost: count 1, mean 0.0ns, max 0.0ns"]
     );
+}
+
+#[test]
+fn a_panel_that_ignores_the_first_e5_gets_a_second_and_then_passes() {
+    capture_log();
+    let rig = after_power_loss_with_widgets();
+    rig.device.ignores_e5.set(1);
+    let config = in_mode_0(Some(2));
+
+    rig.run_configured(config, healthy).unwrap();
+
+    assert_eq!(
+        rig.opcodes(),
+        [PROBE, MODE_QUERY, SET_MODE, MODE_QUERY, SET_MODE, MODE_QUERY, READ_BACK, FEED, FEED]
+    );
+    assert_eq!(rig.attempts(SET_MODE), [0, 1000]);
+    assert_eq!(rig.attempts(MODE_QUERY), [0, 1000, 2000]);
+    assert_eq!(rig.delivered(FEED), [2000, 3000]);
+    assert_eq!(rig.device.mode.get(), RAW_STATS);
+    assert_eq!(
+        logged(Level::Warn, "panel"),
+        ["panel is in mode 8 (raw 0x0B) after E5 1 of 3 with mode 0: sending it again"]
+    );
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+#[test]
+fn a_panel_that_never_takes_e5_gets_exactly_three_then_a_warning_and_the_feed() {
+    capture_log();
+    let rig = after_power_loss_with_widgets();
+    rig.device.ignores_e5.set(u32::MAX);
+    let config = in_mode_0(Some(2));
+
+    rig.run_configured(config, healthy).unwrap();
+
+    assert_eq!(MODE_ATTEMPTS, 3);
+    assert_eq!(rig.attempts(SET_MODE), [0, 1000, 2000]);
+    assert_eq!(rig.attempts(MODE_QUERY), [0, 1000, 2000, 3000]);
+    assert_eq!(rig.attempts(READ_BACK), [3000]);
+    assert_eq!(rig.delivered(FEED), [3000, 4000]);
+    assert_eq!(
+        logged(Level::Warn, "panel")[2],
+        "panel is still in mode 8 (raw 0x0B) after 3 E5 with mode 0: feeding anyway"
+    );
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+#[test]
+fn a_panel_that_ignores_the_first_e1_gets_a_second_and_then_passes() {
+    capture_log();
+    let rig = Rig::new();
+    rig.panel_has(0, 0);
+    rig.device.ignores_e1.set(1);
+
+    rig.ticks(2).unwrap();
+
+    assert_eq!(
+        rig.opcodes(),
+        [PROBE, READ_BACK, DASHBOARD, READ_BACK, DASHBOARD, READ_BACK, FEED, FEED]
+    );
+    assert_eq!(rig.attempts(DASHBOARD), [0, 1000]);
+    assert_eq!(rig.delivered(FEED), [2000, 3000]);
+    assert_eq!(rig.device.panel.get(), (DEFAULT_MASK, DEFAULT_INTERVAL));
+    assert_eq!(
+        logged(Level::Warn, "panel"),
+        [
+            "panel has widgets 0x00 every 0 s after E1 1 of 2 with widgets 0xAF every 3 s: \
+             sending it again"
+        ]
+    );
+    assert_only_allowed_frames(&rig.trace());
+}
+
+#[test]
+fn a_panel_that_never_takes_e1_gets_exactly_two_then_a_warning_and_the_feed() {
+    capture_log();
+    let rig = Rig::new();
+    rig.panel_has(0, 0);
+    rig.device.forgets_e1.set(true);
+
+    rig.ticks(2).unwrap();
+
+    assert_eq!(DASHBOARD_ATTEMPTS, 2);
+    assert_eq!(rig.attempts(DASHBOARD), [0, 1000]);
+    assert_eq!(rig.attempts(READ_BACK), [0, 1000, 2000]);
+    assert_eq!(rig.delivered(FEED), [2000, 3000]);
+    assert_eq!(
+        logged(Level::Warn, "panel")[1],
+        "panel still has widgets 0x00 every 0 s after 2 E1 with widgets 0xAF every 3 s: \
+         feeding anyway"
+    );
+    assert_only_allowed_frames(&rig.trace());
+}
+
+#[test]
+fn a_named_dashboard_must_read_back_exactly_as_sent() {
+    let rig = Rig::new();
+    rig.panel_has(0xFF, 4);
+    rig.device.ignores_e1.set(1);
+    let config = naming(0x05, 7, 1);
+
+    rig.run_configured(config, healthy).unwrap();
+
+    assert_eq!(rig.attempts(DASHBOARD), [0, 1000]);
+    assert_eq!(rig.device.panel.get(), (0x05, 7));
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+#[test]
+fn shutdown_during_the_settle_sends_nothing_more() {
+    let rig = after_power_loss_with_widgets();
+    rig.stop_at(500);
+
+    rig.run_configured(in_mode_0(None), healthy).unwrap();
+
+    rig.assert_stopped_promptly(500);
+    assert_eq!(rig.opcodes(), [PROBE, MODE_QUERY, SET_MODE]);
+}
+
+#[test]
+fn an_upload_during_the_settle_ends_the_connection_and_the_next_finds_the_mode_set() {
+    let rig = after_power_loss_with_widgets();
+    rig.upload(500, 1500);
+    let config = in_mode_0(Some(1));
+
+    rig.run_configured(config, healthy).unwrap();
+
+    // The read-back at 1 s finds the lock busy, so the connection is tried again
+    // after the backoff, and that one finds the mode already set.
+    assert_eq!(rig.attempts(PROBE), [0, 3000]);
+    assert_eq!(rig.attempts(SET_MODE), [0]);
+    assert_eq!(rig.attempts(MODE_QUERY), [0, 3000]);
+    assert_eq!(rig.delivered(FEED), [3000]);
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+/// The ticks that reach just past the first check, at 60 s.
+const PAST_THE_CHECK: u64 = 61;
+
+#[test]
+fn there_is_no_check_before_60_seconds() {
+    assert_eq!(CHECK_PERIOD, Duration::from_secs(60));
+    let rig = Rig::new();
+    rig.panel_in_mode(RAW_STATS);
+
+    rig.run_configured(in_mode_0(Some(60)), healthy).unwrap();
+
+    assert_eq!(rig.attempts(MODE_QUERY), [0]);
+    assert_eq!(rig.attempts(READ_BACK), [0]);
+    assert_eq!(rig.delivered(FEED).last(), Some(&59_000));
+}
+
+#[test]
+fn the_check_reads_de_and_df_between_ticks_under_the_lock() {
+    let rig = Rig::new();
+    rig.panel_in_mode(RAW_STATS);
+    let config = in_mode_0(Some(PAST_THE_CHECK + 60));
+
+    rig.run_configured(config, healthy).unwrap();
+
+    assert_eq!(rig.attempts(MODE_QUERY), [0, 60_000, 120_000]);
+    assert_eq!(rig.attempts(READ_BACK), [0, 60_000, 120_000]);
+    assert_eq!(rig.attempts(PROBE), [0]);
+    assert_eq!(rig.attempts(SET_MODE), []);
+    let trace = rig.trace();
+    let check = trace
+        .iter()
+        .position(|sent| sent.at == 60_000 && sent.opcode() == MODE_QUERY);
+    let check = check.unwrap();
+    assert_eq!(
+        trace[check - 1].opcode(),
+        FEED,
+        "the check follows the tick"
+    );
+    assert_eq!(trace[check + 1].opcode(), READ_BACK);
+    assert_eq!(trace[check + 2].opcode(), FEED);
+    assert_allowed_frames(&trace, config);
+}
+
+#[test]
+fn without_a_mode_the_check_reads_no_de() {
+    let rig = Rig::new();
+
+    rig.ticks(PAST_THE_CHECK).unwrap();
+
+    assert_eq!(rig.attempts(MODE_QUERY), []);
+    assert_eq!(rig.attempts(READ_BACK), [0, 60_000]);
+    assert_only_allowed_frames(&rig.trace());
+}
+
+#[test]
+fn the_check_finds_a_changed_mode_and_sets_the_panel_up_again() {
+    capture_log();
+    let rig = Rig::new();
+    rig.panel_in_mode(RAW_STATS);
+    // An unexplained flip to mode 5, the stored GIF.
+    let device = rig.device.clone();
+    rig.clock.at(30_500, move || device.mode.set(0x06));
+    let config = in_mode_0(Some(PAST_THE_CHECK + 1));
+
+    rig.run_configured(config, healthy).unwrap();
+
+    // The reconnect goes at once: no backoff.
+    assert_eq!(rig.attempts(PROBE), [0, 60_000]);
+    assert_eq!(rig.attempts(MODE_QUERY), [0, 60_000, 60_000, 61_000]);
+    assert_eq!(rig.attempts(SET_MODE), [60_000]);
+    assert_eq!(rig.device.mode.get(), RAW_STATS);
+    assert_eq!(rig.delivered(FEED)[60..], [60_000, 61_000]);
+    assert_eq!(
+        logged(Level::Warn, "check"),
+        ["check: panel is in mode 5 (raw 0x06): setting the panel up again"]
+    );
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+#[test]
+fn the_check_finds_vanished_widgets_and_sets_the_panel_up_again() {
+    capture_log();
+    let rig = Rig::new();
+    let device = rig.device.clone();
+    rig.clock.at(30_500, move || device.panel.set((0, 0)));
+
+    rig.ticks(PAST_THE_CHECK + 1).unwrap();
+
+    assert_eq!(rig.attempts(PROBE), [0, 60_000]);
+    assert_eq!(rig.attempts(READ_BACK), [0, 60_000, 60_000, 61_000]);
+    assert_eq!(rig.attempts(DASHBOARD), [60_000]);
+    assert_eq!(rig.device.panel.get(), (DEFAULT_MASK, DEFAULT_INTERVAL));
+    assert_eq!(
+        logged(Level::Warn, "check"),
+        ["check: panel has widgets 0x00 every 0 s: setting the panel up again"]
+    );
+    assert_only_allowed_frames(&rig.trace());
+}
+
+#[test]
+fn the_check_leaves_other_widgets_alone_when_none_are_named() {
+    let rig = Rig::new();
+    let device = rig.device.clone();
+    rig.clock.at(30_500, move || device.panel.set((0xFF, 4)));
+
+    rig.ticks(PAST_THE_CHECK).unwrap();
+
+    assert_eq!(rig.attempts(PROBE), [0]);
+    assert_eq!(rig.attempts(DASHBOARD), []);
+}
+
+#[test]
+fn the_check_is_skipped_while_an_upload_holds_the_bus() {
+    let rig = Rig::new();
+    rig.upload(59_500, 60_500);
+
+    rig.ticks(PAST_THE_CHECK + 60).unwrap();
+
+    assert_eq!(rig.attempts(READ_BACK), [0, 120_000]);
+    assert_eq!(rig.attempts(PROBE), [0]);
+    assert_only_allowed_frames(&rig.trace());
+}
+
+#[test]
+fn a_failed_check_is_tried_again_after_the_next_tick() {
+    let rig = Rig::new();
+    rig.read_fault(59_500, 60_500, READ_BACK, short_read);
+
+    rig.ticks(PAST_THE_CHECK + 60).unwrap();
+
+    // Retried at 61 s, and from there the next one is due a period after 60 s.
+    assert_eq!(rig.attempts(READ_BACK), [0, 60_000, 61_000, 120_000]);
+    assert_eq!(rig.attempts(PROBE), [0]);
+    assert_only_allowed_frames(&rig.trace());
+}
+
+#[test]
+fn three_failed_checks_in_a_row_end_the_session_even_with_good_writes_between() {
+    let rig = Rig::new();
+    rig.read_fault(59_500, 62_500, READ_BACK, short_read);
+
+    rig.ticks(PAST_THE_CHECK + 3).unwrap();
+
+    assert_eq!(rig.attempts(READ_BACK), [0, 60_000, 61_000, 62_000, 64_000]);
+    assert_eq!(rig.delivered(FEED)[60..], [60_000, 61_000, 62_000, 64_000]);
+    assert_eq!(rig.attempts(PROBE), [0, 64_000]);
+    assert_only_allowed_frames(&rig.trace());
+}
+
+#[test]
+fn a_permission_error_in_the_check_is_fatal() {
+    let rig = Rig::new();
+    rig.read_fault(59_500, 60_500, READ_BACK, || errno_error(Errno::ACCESS));
+
+    let error = rig.ticks(PAST_THE_CHECK + 5).unwrap_err();
+
+    assert!(matches!(error, Error::I2c { .. }), "{error:?}");
+}
+
+#[test]
+fn a_panel_that_never_takes_e5_is_set_up_again_once_a_minute() {
+    let rig = after_power_loss_with_widgets();
+    rig.device.ignores_e5.set(u32::MAX);
+    let config = in_mode_0(Some(130));
+
+    rig.run_configured(config, healthy).unwrap();
+
+    // Each round: three E5 a settle apart, the feed, and a check a minute later.
+    assert_eq!(rig.attempts(PROBE), [0, 63_000, 126_000]);
+    assert_eq!(rig.attempts(SET_MODE).len(), 9);
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+#[test]
+fn the_mode_decision_is_logged_once_per_connection() {
+    capture_log();
+    let rig = after_power_loss_with_widgets();
+    rig.outage(500, 3500);
+
+    rig.run_configured(in_mode_0(Some(5)), healthy).unwrap();
+
+    assert_eq!(
+        logged(Level::Info, "panel is in"),
+        [
+            "panel is in mode 8 (raw 0x0B): sending E5 with mode 0",
+            "panel is in mode 0 (raw 0x01): no E5 needed",
+        ]
+    );
+}
+
+#[test]
+fn a_mode_byte_with_no_meaning_is_logged_as_unknown_and_replaced() {
+    capture_log();
+    let rig = Rig::new();
+    rig.panel_has(0xFF, 4);
+    rig.panel_in_mode(0x09);
+
+    rig.run_configured(in_mode_0(Some(1)), healthy).unwrap();
+
+    assert_eq!(
+        logged(Level::Info, "panel is in"),
+        ["panel is in unknown mode (raw 0x09): sending E5 with mode 0"]
+    );
+    assert_eq!(rig.device.mode.get(), RAW_STATS);
+}
+
+#[test]
+fn without_a_mode_nothing_about_the_mode_is_logged() {
+    capture_log();
+    let rig = Rig::new();
+
+    rig.ticks(1).unwrap();
+
+    assert_eq!(logged(Level::Info, "panel is in"), [""; 0]);
 }
 
 #[test]
@@ -2308,4 +3055,45 @@ fn dry_run_ends_on_a_closed_stdout_rather_than_reconnecting() {
 
     assert!(matches!(error, Error::I2c { .. }), "{error:?}");
     assert_eq!(rig.clock.elapsed_ms(), 0);
+}
+
+#[test]
+fn dry_run_with_a_mode_shows_de_and_e5_before_df_and_e1() {
+    let rig = Rig::new();
+    let output = Output::default();
+    let config = DaemonConfig {
+        mode: Some(Mode::Faith1),
+        max_ticks: Some(1),
+        ..DaemonConfig::default()
+    };
+
+    dry_run_on(&rig, config, no_sensors, output.clone()).unwrap();
+
+    let text = String::from_utf8(output.0.borrow().clone()).unwrap();
+    let position = |needle: &str| text.find(needle).expect(needle);
+    let order = [
+        "DE GetMode",
+        "so E5 is shown; a real run decides from DE",
+        "E5 SetMode",
+        "DF GetDisplay",
+        "so E1 is shown; a real run decides from DF",
+        "E1 SetDisplay",
+    ];
+    for pair in order.windows(2) {
+        assert!(position(pair[0]) < position(pair[1]), "{pair:?}: {text}");
+    }
+    let modes = text.lines().filter(|line| line.starts_with("E5 "));
+    assert_eq!(modes.count(), 1, "{text}");
+}
+
+#[test]
+fn dry_run_without_a_mode_shows_no_de_or_e5() {
+    let rig = Rig::new();
+    let output = Output::default();
+
+    dry_run(&rig, Some(1), output.clone()).unwrap();
+
+    let text = String::from_utf8(output.0.borrow().clone()).unwrap();
+    assert!(!text.lines().any(|line| line.starts_with("DE ")), "{text}");
+    assert!(!text.lines().any(|line| line.starts_with("E5 ")), "{text}");
 }

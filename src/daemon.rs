@@ -5,17 +5,24 @@
 //! [`run_with`] is a state machine over injected parts, which is how every
 //! failure below is tested on a fake clock:
 //!
-//! - **Connect:** through the [write gate](crate::session), then `DF`, then at
-//!   most one `E1`, then `E3` until the bus fails. `EB 03`, `DF`, that `E1` and
-//!   `E3` are all this module sends: `AA` writes NVRAM. See below for when `E1`
-//!   goes out.
+//! - **Connect:** through the [write gate](crate::session), then, if a mode is
+//!   configured, `DE` and up to [`MODE_ATTEMPTS`] `E5`, then `DF` and up to
+//!   [`DASHBOARD_ATTEMPTS`] `E1`, each `E5` and `E1` checked by a read-back, then
+//!   `E3` until the bus fails. `EB 03`, `DE`, `E5`, `DF`, `E1` and `E3` are all
+//!   this module sends: `AA` writes NVRAM. See below for when `E5` and `E1` go
+//!   out.
+//! - **The check:** every [`CHECK_PERIOD`] while feeding, `DE` if a mode is
+//!   configured and `DF` always. A panel that needs an `E5` or `E1` again ends
+//!   the session, and the reconnect sets it up anew. See
+//!   [below](self#the-check-once-a-minute).
 //! - **Ticks** run on deadlines, each the previous one plus [`TICK`], so the
 //!   time spent working does not add up. A missed deadline is dropped rather
 //!   than made up for: late frames carry stale values, and a burst of them is
 //!   all that a catch-up could add.
 //! - **The lock** is held for one write only and sensors are read without it,
 //!   so an upload can take the bus between any two ticks. If an upload holds it,
-//!   the tick is skipped. That is normal operation: no error and no backoff.
+//!   the tick is skipped. That is normal operation: no error and no backoff. No
+//!   wait ever holds the lock, including the settle after `E5` and `E1`.
 //! - **Failed writes** are retried on the next tick. See below. The adaptive
 //!   feed has no next tick to retry on, as [its section](self#the-adaptive-feed)
 //!   explains.
@@ -23,12 +30,49 @@
 //!   reads as a failure, where a repeated value would look live.
 //! - **Shutdown** sends nothing: the panel is left exactly as it is.
 //!
+//! # When `E5` goes out
+//!
+//! The display mode is RAM state. After a power loss the real panel read mode 8,
+//! the preset rotation, although it had been in mode 0 when `AA` was sent, and
+//! mode 8 shows the stats only part of the time. So `save` cannot make a mode
+//! stick, and the daemon sets it instead: with [`DaemonConfig::mode`] set, each
+//! connection reads `DE` and sends `E5` only if the panel is in another mode.
+//! Unset, the daemon reads and sends neither, and the mode is left alone.
+//!
+//! This comes before `DF`, so a connection's mode is settled before its widgets.
+//! With a mode set, the daemon keeps that mode: a mode set by hand, or by an
+//! upload, is switched back by [the check](self#the-check-once-a-minute) within
+//! about a minute. A failed `DE` never leads to a blind `E5`: like a failed
+//! `DF`, it fails the connection and takes the normal backoff, and nothing else
+//! goes out on it. A dry-run prints the `DE` query and the `E5` a real run might
+//! send.
+//!
+//! # Why each `E5` and `E1` is read back
+//!
+//! On its first real run from mode 8, the daemon logged one `E5` with mode 0 and
+//! one `E1`, every write succeeded, and yet the panel ended in mode 5, the stored
+//! GIF, with no widgets every 0 s. 17 later runs did not reproduce it. The writes
+//! succeeding says little, so each one is checked: [`SETTLE`] after an `E5` the
+//! daemon reads `DE`, and sends `E5` again while the panel is in another mode, up
+//! to [`MODE_ATTEMPTS`] in all. [`SETTLE`] after an `E1` it reads `DF`, which
+//! must show what was sent, and sends `E1` again up to [`DASHBOARD_ATTEMPTS`] in
+//! all. `E1` gets fewer, as the prime suspect in dark-panel incidents.
+//!
+//! A panel that still disagrees gets a warning and the feed regardless: a panel
+//! that will not take a mode must not lose its stats as well. The check then
+//! finds it unchanged and reconnects, so such a panel gets this round once a
+//! minute. A failed read-back fails the connection like a failed `DE` or `DF`.
+//! The lock is let go for each settle, so an upload can take the bus then, and
+//! the read-back that follows fails the connection with the lock busy, which
+//! means a reconnect after the normal backoff.
+//!
 //! # When `E1` goes out
 //!
-//! `E1` is the prime suspect in dark-panel incidents (`RECOVERY.md`), and the
-//! panel keeps its widget config across boots: `DF` read all eight widgets every
-//! 4 s on a panel this tool had never written to. So each connection reads `DF`
-//! and sends `E1` only for a reason:
+//! `E1` is the prime suspect in dark-panel incidents (`RECOVERY.md`). The widget
+//! config often outlives a reboot: `DF` read all eight widgets every 4 s on a
+//! panel this tool had never written to. It does not outlive everything, though:
+//! after a power loss the same panel read no widgets every 0 s. So each
+//! connection reads `DF` and sends `E1` only for a reason:
 //!
 //! - If the config names widgets, when the panel's widgets or interval differ.
 //! - If it names none, when the panel has no widget enabled, and then the
@@ -39,6 +83,24 @@
 //! It fails the connection like any other session step, and takes the normal
 //! backoff. A dry-run has no read-backs: it prints the `DF` query and the `E1` a
 //! real run might send, and says that a real run decides.
+//!
+//! # The check once a minute
+//!
+//! The panel has twice switched to mode 5 with nobody asking, and widgets can
+//! vanish, and neither makes a write fail, so nothing else would notice. So every
+//! [`CHECK_PERIOD`] on the feed's clock, between two ticks, the daemon reads `DE`
+//! if a mode is configured, and `DF` always. It decides as a connection does,
+//! through the same functions, so the two cannot disagree. If an `E5` or `E1`
+//! would go out, it logs a warning with what it read and ends the session, and
+//! the reconnect, at once and with no backoff, runs the connect steps again.
+//!
+//! The check takes the lock as a tick does, once for both reads. If an upload
+//! holds it, the check is skipped until the next period. A check whose read
+//! fails is handled like a failed write: it is tried again after the next tick,
+//! and [`WRITE_ATTEMPTS`] failed checks in a row end the session, which then
+//! reconnects with the normal backoff. These have a count of their own, apart
+//! from failed `E3`, because a good `E3` in between says nothing about whether
+//! the panel answers reads. A dry-run has no read-backs, so it has no check.
 //!
 //! # Why a failed write waits for the next tick
 //!
@@ -131,10 +193,11 @@ use crate::bus::transport::{DryRun, Transport};
 use crate::error::{Error, Result};
 use crate::panel::{Panel, Sleep, ThreadSleep};
 use crate::protocol::{
-    parse_widgets, DisplayStatus, Elements, FeedFrameLen, SensorSample, DEFAULT_WIDGETS,
+    parse_widgets, DisplayStatus, Elements, FeedFrameLen, Mode, ModeStatus, SensorSample,
+    DEFAULT_WIDGETS,
 };
 use crate::sensors::{NvmlSensors, SensorSource};
-use crate::session::{self, Options, Session, Unlocked};
+use crate::session::{self, Options, Session, Unlocked, Verified};
 
 /// The time between two deadlines. The panel wants `E3` at about 1 Hz.
 pub const TICK: Duration = Duration::from_secs(1);
@@ -168,6 +231,18 @@ pub const ADAPTIVE_PAIR_GAP_TICKS: u32 = 1;
 
 /// Ticks between two summaries of the write cost at info level.
 pub const WRITE_COST_REPORT_TICKS: u64 = 60;
+
+/// How long the panel gets after an `E5` or `E1` before it is read back.
+pub const SETTLE: Duration = Duration::from_secs(1);
+
+/// The most `E5` one connection sends. See the [module docs](self).
+pub const MODE_ATTEMPTS: u32 = 3;
+
+/// The most `E1` one connection sends. See the [module docs](self).
+pub const DASHBOARD_ATTEMPTS: u32 = 2;
+
+/// The time between two checks of the mode and widgets while feeding.
+pub const CHECK_PERIOD: Duration = Duration::from_secs(60);
 
 /// How often `E3` goes out. See the [module docs](self#the-adaptive-feed).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -207,6 +282,9 @@ pub struct DaemonConfig {
     pub feed: FeedFrameLen,
     /// How often an `E3` goes out.
     pub strategy: FeedStrategy,
+    /// The display mode to set on each connection. `None` leaves the mode alone:
+    /// see the [module docs](self#when-e5-goes-out).
+    pub mode: Option<Mode>,
     /// Stops after this many ticks. Only tests and dry-run set this.
     pub max_ticks: Option<u64>,
 }
@@ -219,6 +297,7 @@ impl Default for DaemonConfig {
             interval_s: 3,
             feed: FeedFrameLen::Full,
             strategy: FeedStrategy::Adaptive,
+            mode: None,
             max_ticks: None,
         }
     }
@@ -245,6 +324,12 @@ impl DaemonConfig {
             None => panel.elements == Elements::NONE,
         };
         needed.then_some(wanted)
+    }
+
+    /// The mode `E5` should select for a panel reporting `panel`, or `None` if it
+    /// should not be sent. A raw mode with no known meaning is another mode.
+    fn mode_for(&self, panel: ModeStatus) -> Option<Mode> {
+        self.mode.filter(|&wanted| panel.mode() != Some(wanted))
     }
 }
 
@@ -286,8 +371,12 @@ impl<S: Sleep> Sleep for UntilStopped<S> {
 }
 
 /// What a dry-run prints between the `DF` query and `E1`.
-const WOULD_DECIDE: &str =
-    "dry-run: read-backs are unavailable, so E1 is shown; a real run decides from DF";
+const WOULD_DECIDE: &str = "dry-run: read-backs are unavailable, so E1 is shown; a real run \
+     decides from DF, reads DF back 1 s after each E1 and sends at most 2";
+
+/// What a dry-run prints between the `DE` query and `E5`.
+const WOULD_DECIDE_MODE: &str = "dry-run: read-backs are unavailable, so E5 is shown; a real \
+     run decides from DE, reads DE back 1 s after each E5 and sends at most 3";
 
 /// What [`run_with`] reaches the outside world through. [`run`] fills this in
 /// with the real ones, and tests with harmless ones.
@@ -426,6 +515,26 @@ impl<T: Transport, W: Write> Link<T, W> {
         }
     }
 
+    /// Reads what [the check](self#the-check-once-a-minute) reads, under one lock.
+    /// Returns what was read if it calls for a new setup. A dry-run has nothing
+    /// to read, so it always passes.
+    fn check(&mut self, config: &DaemonConfig) -> Result<Option<String>> {
+        let Self::Live(unlocked) = self else {
+            return Ok(None);
+        };
+        let mut panel = Panel::new(unlocked.lock()?);
+        if config.mode.is_some() {
+            let status = panel.mode()?;
+            if config.mode_for(status).is_some() {
+                return Ok(Some(format!("panel is in {}", describe_mode(status))));
+            }
+        }
+        let shown = panel.display()?;
+        Ok(config
+            .update_for(shown)
+            .map(|_| format!("panel has {}", describe_dashboard(shown))))
+    }
+
     /// Says why a tick shows no frame. Only a dry-run has anyone to tell.
     fn explain_silent_tick(&mut self) -> Result<()> {
         match self {
@@ -445,6 +554,61 @@ enum Ended {
     Stopped,
     /// The bus failed, so the session is gone.
     BusLost,
+    /// The check found the panel needing a new setup.
+    Stale,
+}
+
+/// What a check asks of the feed.
+enum Checked {
+    /// Passed, or skipped for an upload: the next one is due a period later.
+    Done,
+    /// Its reads failed: it is due again after the next tick.
+    Again,
+    /// The session is over.
+    End(Ended),
+}
+
+/// The bus during the connect steps: under the gate's lock until the first
+/// settle, and from then on under a lock for each step, so no wait holds it.
+/// Exactly one of the two is set.
+struct Access<T> {
+    gate: Option<Verified<T>>,
+    free: Option<Unlocked<T>>,
+}
+
+impl<T: Transport> Access<T> {
+    fn new(verified: Verified<T>) -> Self {
+        Self {
+            gate: Some(verified),
+            free: None,
+        }
+    }
+
+    /// Runs `step` on the bus. Without the gate's lock, this takes the lock for
+    /// the step, and fails with [`Error::LockBusy`] if an upload holds it.
+    fn step<R>(
+        &mut self,
+        step: impl FnOnce(&mut Panel<&mut dyn Transport>) -> Result<R>,
+    ) -> Result<R> {
+        if let Some(verified) = &mut self.gate {
+            return step(&mut Panel::new(verified as &mut dyn Transport));
+        }
+        let unlocked = self.free.as_mut().expect("the gate or a free link");
+        let mut bus = unlocked.lock()?;
+        step(&mut Panel::new(&mut bus as &mut dyn Transport))
+    }
+
+    /// Lets the gate's lock go, for a wait.
+    fn release(&mut self) {
+        if let Some(verified) = self.gate.take() {
+            self.free = Some(verified.unlock());
+        }
+    }
+
+    fn into_unlocked(mut self) -> Unlocked<T> {
+        self.release();
+        self.free.expect("the gate or a free link")
+    }
 }
 
 /// Decides from each poll what the tick sends, if anything. One lives for one
@@ -718,6 +882,7 @@ where
             match self.feed(link, pci_bus)? {
                 Ended::Stopped => break,
                 Ended::BusLost => wait_first = true,
+                Ended::Stale => wait_first = false,
             }
         }
         Ok(())
@@ -749,9 +914,11 @@ where
         }
     }
 
-    /// One pass through the gate, then `DF` and any `E1` of this connection, under
-    /// the gate's lock so that an upload cannot slip in between. A failed `DF`
-    /// returns from here like any other error, so the caller backs off.
+    /// One pass through the gate, then any `DE` and `E5`, then `DF` and any `E1`
+    /// of this connection, with their read-backs. Up to the first settle this runs
+    /// under the gate's lock, so that an upload cannot slip in after the probe, and
+    /// from there under a lock for each step. A failed read-back returns from here
+    /// like any other error, so the caller backs off.
     fn connect_once(&mut self) -> Result<Option<Connection<T, W>>> {
         let session = (self.connect)()?;
         // The gate can take seconds, and a shutdown sends nothing.
@@ -759,12 +926,13 @@ where
             return Ok(None);
         }
         match session {
-            Session::Live(mut verified) => {
-                if !self.configure(&mut verified)? {
+            Session::Live(verified) => {
+                let pci_bus = verified.adapter().pci_bus();
+                let mut access = Access::new(verified);
+                if !self.configure(&mut access)? {
                     return Ok(None);
                 }
-                let pci_bus = verified.adapter().pci_bus();
-                Ok(Some((Link::Live(verified.unlock()), pci_bus)))
+                Ok(Some((Link::Live(access.into_unlocked()), pci_bus)))
             }
             Session::DryRun(mut dry_run) => {
                 self.preview(&mut dry_run)?;
@@ -773,25 +941,98 @@ where
         }
     }
 
-    /// Reads `DF` and sends `E1` if the panel needs it. `false` if asked to stop.
-    fn configure(&self, transport: &mut impl Transport) -> Result<bool> {
-        let mut panel = Panel::new(transport);
-        let shown = panel.display()?;
-        let update = self.config.update_for(shown);
-        log_decision(shown, update);
-        // The read took time, and a shutdown sends nothing.
-        if self.stopped() {
+    /// Sets the mode if one is configured, then reads `DF` and sends `E1` if the
+    /// panel needs it, each checked by a read-back. `false` if asked to stop.
+    fn configure(&mut self, access: &mut Access<T>) -> Result<bool> {
+        if self.config.mode.is_some() && !self.set_mode(access)? {
             return Ok(false);
         }
-        if let Some(wanted) = update {
-            panel.set_dashboard(wanted.elements, wanted.interval_s)?;
+        self.set_dashboard(access)
+    }
+
+    /// Reads `DE` and sends `E5` until the panel reports the mode or
+    /// [`MODE_ATTEMPTS`] are used up. `false` if asked to stop.
+    fn set_mode(&mut self, access: &mut Access<T>) -> Result<bool> {
+        let mut status = access.step(|panel| panel.mode())?;
+        let mut update = self.config.mode_for(status);
+        log_mode_decision(status, update);
+        for sent in 1..=MODE_ATTEMPTS {
+            let Some(wanted) = update else {
+                return Ok(true);
+            };
+            // The read took time, and a shutdown sends nothing.
+            if self.stopped() {
+                return Ok(false);
+            }
+            access.step(|panel| panel.set_mode(wanted))?;
+            if !self.settle(access) {
+                return Ok(false);
+            }
+            status = access.step(|panel| panel.mode())?;
+            update = self.config.mode_for(status);
+            if update.is_some() {
+                let number = wanted.number();
+                let read = describe_mode(status);
+                if sent < MODE_ATTEMPTS {
+                    log::warn!("panel is in {read} after E5 {sent} of {MODE_ATTEMPTS} with mode {number}: sending it again");
+                } else {
+                    log::warn!("panel is still in {read} after {sent} E5 with mode {number}: feeding anyway");
+                }
+            }
         }
         Ok(true)
+    }
+
+    /// Reads `DF` and, if the panel needs it, sends `E1` until `DF` shows what was
+    /// sent or [`DASHBOARD_ATTEMPTS`] are used up. `false` if asked to stop.
+    fn set_dashboard(&mut self, access: &mut Access<T>) -> Result<bool> {
+        let shown = access.step(|panel| panel.display())?;
+        let update = self.config.update_for(shown);
+        log_decision(shown, update);
+        let Some(wanted) = update else {
+            return Ok(true);
+        };
+        for sent in 1..=DASHBOARD_ATTEMPTS {
+            // The read took time, and a shutdown sends nothing.
+            if self.stopped() {
+                return Ok(false);
+            }
+            access.step(|panel| panel.set_dashboard(wanted.elements, wanted.interval_s))?;
+            if !self.settle(access) {
+                return Ok(false);
+            }
+            let shown = access.step(|panel| panel.display())?;
+            if shown == wanted {
+                return Ok(true);
+            }
+            let (read, asked) = (describe_dashboard(shown), describe_dashboard(wanted));
+            if sent < DASHBOARD_ATTEMPTS {
+                log::warn!("panel has {read} after E1 {sent} of {DASHBOARD_ATTEMPTS} with {asked}: sending it again");
+            } else {
+                log::warn!("panel still has {read} after {sent} E1 with {asked}: feeding anyway");
+            }
+        }
+        Ok(true)
+    }
+
+    /// Lets go of the gate's lock and waits [`SETTLE`]. `false` if asked to stop.
+    fn settle(&mut self, access: &mut Access<T>) -> bool {
+        access.release();
+        let deadline = self.clock.now() + SETTLE;
+        self.wait_until(deadline)
     }
 
     /// Shows what [`Self::configure`] might send. There is no reply to decide
     /// from, but a failure to print still ends the run.
     fn preview(&self, dry_run: &mut DryRun<W>) -> Result<()> {
+        if let Some(wanted) = self.config.mode {
+            match Panel::new(&mut *dry_run).mode() {
+                Err(Error::ReadbackUnavailable) => {}
+                other => drop(other?),
+            }
+            dry_run.note(WOULD_DECIDE_MODE)?;
+            Panel::new(&mut *dry_run).set_mode(wanted)?;
+        }
         match Panel::new(&mut *dry_run).display() {
             Err(Error::ReadbackUnavailable) => {}
             other => drop(other?),
@@ -808,6 +1049,8 @@ where
         let mut failures = 0;
         let mut schedule = FeedSchedule::new(self.config.strategy);
         let mut explained = false;
+        let mut next_check = deadline + CHECK_PERIOD;
+        let mut failed_checks = 0;
         while !self.out_of_ticks() && self.wait_until(deadline) {
             let sample = self.sensors.sample(self.clock.now(), pci_bus);
             // A sensor read can stall, and a shutdown sends nothing.
@@ -845,9 +1088,47 @@ where
             if self.ticks.is_multiple_of(WRITE_COST_REPORT_TICKS) {
                 self.write_cost.report();
             }
+            if self.clock.now() >= next_check {
+                match self.check(&mut link, &mut failed_checks)? {
+                    Checked::Done => {
+                        next_check = next_after(next_check, self.clock.now(), CHECK_PERIOD);
+                    }
+                    Checked::Again => {}
+                    Checked::End(ended) => return Ok(ended),
+                }
+            }
             deadline = next_deadline(deadline, self.clock.now());
         }
         Ok(Ended::Stopped)
+    }
+
+    /// Runs [the check](self#the-check-once-a-minute). `failed` counts the checks
+    /// in a row whose reads failed.
+    fn check(&mut self, link: &mut Link<T, W>, failed: &mut u32) -> Result<Checked> {
+        match link.check(&self.config) {
+            Ok(None) => {
+                *failed = 0;
+                Ok(Checked::Done)
+            }
+            Ok(Some(found)) => {
+                log::warn!("check: {found}: setting the panel up again");
+                Ok(Checked::End(Ended::Stale))
+            }
+            Err(Error::LockBusy { .. }) => {
+                log::debug!("an upload holds the bus: check skipped");
+                Ok(Checked::Done)
+            }
+            Err(error) if self.is_fatal(&error) => Err(error),
+            Err(error) => {
+                *failed += 1;
+                if *failed == WRITE_ATTEMPTS {
+                    self.connection.report(&error);
+                    return Ok(Checked::End(Ended::BusLost));
+                }
+                log::debug!("check failed, trying again after the next tick: {error}");
+                Ok(Checked::Again)
+            }
+        }
     }
 
     /// Waits for `deadline` in slices, so that a stop request is seen in time.
@@ -891,14 +1172,46 @@ fn log_decision(shown: DisplayStatus, update: Option<DisplayStatus>) {
     }
 }
 
+/// A mode read-back for the log, such as `mode 8 (raw 0x0B)`.
+fn describe_mode(status: ModeStatus) -> String {
+    let raw = status.raw_mode;
+    match status.mode() {
+        Some(mode) => format!("mode {} (raw 0x{raw:02X})", mode.number()),
+        None => format!("unknown mode (raw 0x{raw:02X})"),
+    }
+}
+
+/// A widget config for the log, such as `widgets 0xAF every 3 s`.
+fn describe_dashboard(status: DisplayStatus) -> String {
+    let (mask, interval) = (status.elements.bits(), status.interval_s);
+    format!("widgets 0x{mask:02X} every {interval} s")
+}
+
+/// Logs what mode the panel is in and whether `E5` goes out.
+fn log_mode_decision(shown: ModeStatus, update: Option<Mode>) {
+    let mode = describe_mode(shown);
+    match update {
+        Some(wanted) => log::info!(
+            "panel is in {mode}: sending E5 with mode {}",
+            wanted.number()
+        ),
+        None => log::info!("panel is in {mode}: no E5 needed"),
+    }
+}
+
 /// The deadline after `previous`. If that one has passed already it is dropped,
 /// not made up for: see the [module docs](self).
 fn next_deadline(previous: Instant, now: Instant) -> Instant {
-    let next = previous + TICK;
+    next_after(previous, now, TICK)
+}
+
+/// `previous` plus `period`, or `now` plus `period` if that has passed already.
+fn next_after(previous: Instant, now: Instant, period: Duration) -> Instant {
+    let next = previous + period;
     if next > now {
         next
     } else {
-        now + TICK
+        now + period
     }
 }
 
@@ -927,7 +1240,47 @@ mod tests {
         assert_eq!(config.dashboard().interval_s, 3);
         assert_eq!(config.feed, FeedFrameLen::Full);
         assert_eq!(config.strategy, FeedStrategy::Adaptive);
+        assert_eq!(config.mode, None);
         assert_eq!(config.max_ticks, None);
+    }
+
+    fn in_mode(raw_mode: u8) -> ModeStatus {
+        ModeStatus { raw_mode, on: true }
+    }
+
+    #[test]
+    fn without_a_mode_no_mode_is_ever_set() {
+        let config = DaemonConfig::default();
+
+        for raw in [0x00, 0x01, 0x0A, 0x0B, 0xFF] {
+            assert_eq!(config.mode_for(in_mode(raw)), None, "{raw:02X}");
+        }
+    }
+
+    #[test]
+    fn a_configured_mode_is_set_only_when_the_panel_reports_another() {
+        let config = DaemonConfig {
+            mode: Some(Mode::Faith1),
+            ..DaemonConfig::default()
+        };
+
+        assert_eq!(config.mode_for(in_mode(0x01)), None);
+        assert_eq!(config.mode_for(in_mode(0x0B)), Some(Mode::Faith1));
+        assert_eq!(config.mode_for(in_mode(0x02)), Some(Mode::Faith1));
+        // No known meaning, so it cannot be the mode asked for.
+        assert_eq!(config.mode_for(in_mode(0x09)), Some(Mode::Faith1));
+        assert_eq!(config.mode_for(in_mode(0x00)), Some(Mode::Faith1));
+    }
+
+    #[test]
+    fn the_carousel_matches_either_byte_it_reads_back_as() {
+        let config = DaemonConfig {
+            mode: Some(Mode::Carousel),
+            ..DaemonConfig::default()
+        };
+
+        assert_eq!(config.mode_for(in_mode(0x08)), None);
+        assert_eq!(config.mode_for(in_mode(0x0A)), None);
     }
 
     #[test]

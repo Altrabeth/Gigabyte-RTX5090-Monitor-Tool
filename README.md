@@ -72,15 +72,27 @@ sudo install -Dm644 dist/aorus-lcd.toml /etc/aorus-lcd.toml
 
 ### Boot into the stat screen
 
-The daemon does not set the display mode, so after a cold boot the panel shows what is saved in its
-NVRAM, which may not be a screen with widgets. Run this once. `save` writes the panel's NVRAM:
+The panel does not keep its display mode across a power loss: after one it read mode 8, the preset
+rotation, although it had been saved in mode 0. Mode 8 shows the stats only part of the time, and
+`aorus-lcd save` does not help. Let the daemon set the mode instead. Set this in
+`/etc/aorus-lcd.toml`, installed from the example config above, then restart the daemon:
 
-```bash
-aorus-lcd mode 0
-aorus-lcd save
+```toml
+mode = 0
 ```
 
-Whether a save survives a cold power-off has not been verified.
+```bash
+sudo systemctl restart aorus-lcd
+```
+
+Each time it connects, the daemon reads the mode and sends `E5` only if the panel is in another one.
+It reads the mode back a second later and tries again, up to 3 `E5` in all. Since the mode did not
+survive the power loss, `E5` looks like RAM only, so this should cause no wear.
+
+With `mode` set, the daemon keeps that mode. It reads the mode once a minute, so a mode set by hand
+with `aorus-lcd mode`, or by an upload, is switched back within about a minute. To show other
+content, stop the daemon or leave `mode` out. The same check reads the widgets, and puts them back
+if they vanish.
 
 ### Package
 
@@ -221,11 +233,11 @@ run uploads in a loop, because nobody knows how many writes that memory can take
 
 An upload sends no `E1`, so a sensor overlay stays on top of the content. `--no-overlay` sends `E1`
 with no widgets after a successful upload, which clears the panel's selection rather than hiding it.
-It stays cleared until `dashboard` sets it or a daemon connects, because the daemon puts widgets back
-on a panel that has none.
+It stays cleared until `dashboard` sets it, or for about a minute with a daemon running, because the
+daemon puts widgets back on a panel that has none.
 
 The daemon does not need stopping for an upload or `recover`: they share the bus lock, and it skips
-its ticks while they run.
+its ticks while they run. With `mode` set, though, it switches the mode back within about a minute.
 
 ## Daemon
 
@@ -254,10 +266,13 @@ before it touches the bus. See [`dist/aorus-lcd.toml`](dist/aorus-lcd.toml).
 | `feed` | `--feed` | `"adaptive"` or `"steady"` | `"adaptive"` |
 | `frame_bytes` | `--frame-bytes` | 256 or 128 | 256 |
 | `bus` | `--bus` | An NVIDIA adapter's bus number | Autodetect |
+| `mode` | `--mode` | A display mode, 0 to 8, as for `aorus-lcd mode`. Kept: checked once a minute. | Leave the mode alone |
 
 The daemon sends `E1` only if the panel needs it, so a config that names no widgets keeps the panel's
 selection and interval. The exception is a panel with no widget enabled, which gets the defaults
 above. With `widgets` set, `E1` goes out on connect whenever the panel's widgets or interval differ.
+Each `E1` is read back a second later, with at most 2 per connection, and once a minute the daemon
+reads the widgets and sets the panel up again if they call for an `E1`.
 `E1` has been sent to this panel twice with no dark-panel event, but it is still the prime suspect
 in upstream's dark-panel incidents. The daemon avoids it unless needed, so leave `widgets` out unless
 you need it.
