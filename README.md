@@ -8,7 +8,7 @@ On Linux the panel otherwise just loops a built-in animation. With this tool it 
 - **Show live GPU stats** (temperature, clocks, usage, fan, VRAM, power), fed by a background
   daemon that starts at boot.
 - **Show your own content**: image, text or animated GIF.
-- **Control the panel**: on and off, built-in screens, carousel list, saving to its NVRAM.
+- **Control the panel**: on and off, built-in screens, carousel list.
 - **Repair a frozen or dark panel** with `aorus-lcd recover`.
 
 It has been tested on one card, and parts of it have never run on real hardware: see
@@ -134,10 +134,17 @@ firmware 1.3, driver 615.78.08, subsystem `1458:416e`, kernel 6.18.
 - `recover` on an actually dark panel, or with `--overlay` or `--clear-overlay`.
 - `--no-overlay`, and an `E1` sent by the daemon. `E1` has reached the real panel only through the
   two `dashboard` runs above, with no dark-panel event.
-- Whether `AA`, the save frame, survives a cold power-off.
 - The systemd unit and the PKGBUILD have never been installed, because no root was available.
 - Frame-rate effect in real games. The 35 ms driver stall under [Feed cost](#feed-cost) is a proxy.
 - Suspend and resume.
+
+**After a power loss**, from one shutdown on 2026-11-06:
+
+- The panel started in mode 8 with no widgets, every 0 s. Before, it had been in mode 0 with all
+  eight widgets every 4 s, and `save` had been sent in mode 0. So `save` did not keep the mode.
+- The stored text, image and GIF all came back. Uploads write persistent memory.
+- So there is no screen with several stats at once. The only way to draw one would be to upload a
+  picture of the stats, and refreshing it every few seconds could wear out that memory.
 
 **Soak test:** 3 hours with the default settings on an idle GPU, never above 5%. 10,749 of 10,755
 `E3` writes succeeded, with no reconnects and no unexplained mode change. It says nothing about long
@@ -176,8 +183,11 @@ adapter, `--dry-run`, which prints the frames and touches no bus, and `-v`, repe
 - **`status`** shows firmware, mode, on-state, widgets and the carousel banks.
 - **`mode`**: 0 to 2 are the stat screens, 3 image, 4 text, 5 GIF, 6 chibi clock, 7 carousel, 8 preset
   rotation. No built-in screen shows more than one stat at a time, checked by eye on modes 0, 1, 2
-  and 6 and on an image: widgets rotate one by one. Mode 8 is what the card reported at rest. What it does is known only from upstream notes
-  on an RTX 5080: a rotation of the built-in screens plus stored user content. The firmware overlay
+  and 6 and on an image: widgets rotate one by one. Mode 5 shows the last GIF uploaded, which the
+  panel keeps without power. A GIF of numbers is a picture, so its values never change. Mode 8 is
+  where the panel starts after a power loss. After one, it showed the stored text, then the stored
+  image, then the built-in animation, which fits upstream notes on an RTX 5080: a rotation of the
+  built-in screens plus stored user content. The firmware overlay
   is drawn over GIF content too, checked by eye: a value appeared over a GIF while widgets were
   enabled, and vanished once they were cleared.
 - **`image`**, **`gif`**: the picture is resized to 320x170 without keeping its aspect ratio. `image`
@@ -197,11 +207,17 @@ adapter, `--dry-run`, which prints the frames and touches no bus, and `-v`, repe
   and `power`. The defaults are `temp,clock,usage,fan,vram,power` every 3 s. `--off` turns every
   widget off. The setting is not saved, and widgets freeze without a running daemon.
 - **`recover`** is described under [Troubleshooting](#troubleshooting).
-- **`save`** writes the panel configuration to NVRAM. The references also send this frame to start
-  the rainbow in text mode, see `text` above.
+- **`save`** sends `AA`, which the references describe as saving the panel configuration to NVRAM.
+  On this panel it did not keep the mode: one sent in mode 0 was followed by mode 8 after a power
+  loss, see [Status](#status). The references also send this frame to start the rainbow in text
+  mode, see `text` above.
 
-Commands that write NVRAM: `save`, `image --save`, `recover --save`, and `text` without
+Commands that send `AA`: `save`, `image --save`, `recover --save`, and `text` without
 `--no-effect`. The daemon never does.
+
+Every upload, from `image`, `text`, `gif` or `recover`, writes the panel's persistent memory: all
+three kinds of content survived a power loss. That is fine for an upload now and then, but do not
+run uploads in a loop, because nobody knows how many writes that memory can take.
 
 An upload sends no `E1`, so a sensor overlay stays on top of the content. `--no-overlay` sends `E1`
 with no widgets after a successful upload, which clears the panel's selection rather than hiding it.
