@@ -46,7 +46,7 @@ Every command is one 256-byte write:
 | `E1` | SetDisplay | Widget flags and rotation interval, section 3 |
 | `E3` | SensorFeed | Live values, section 4 |
 | `EA` | SetImageTpl | Overlay template, section 5 |
-| `AA` | Save | Persists the configuration to panel NVRAM. The references also send it as the text rainbow trigger, see below. The daemon never sends it. |
+| `AA` | Save | Persists the configuration to panel NVRAM, according to the references. On firmware 1.3 a mode 0 set before it did not survive a power loss: the panel started in mode 8. The references also send it as the text rainbow trigger, see below. The daemon never sends it. |
 | `F3` | SetLoop | `[5]` = interval, `[6..]` = mode + 1 list. Accepts modes 0 to 6 only. |
 | `F2` / `F1` | Upload marker, header | Section 6 |
 | `D6` | GetFWVersion | Read 4 |
@@ -150,8 +150,11 @@ Positions are big-endian.
 - Image and text payloads are the 12-byte descriptor `01 00 0B A9 01 00 40 01 AA 00 01 00` followed
   by the pixels.
 - The firmware sets the pace: about 0.5 s after BEGIN, 1.0 s after the header, about 10 ms per chunk.
-- Framebuffer targets in the `F1` header: image `0x01300000`, text `0x01320000`, GIF `0x00000000`
-  (live buffer).
+- Framebuffer targets in the `F1` header: image `0x01300000`, text `0x01320000`, GIF `0x00000000`.
+  Upstream calls the GIF target a live buffer, but it is not RAM.
+- **All three targets are persistent.** After a power loss on firmware 1.3, the stored image, text
+  and GIF all came back, while the mode and widgets did not. The waits after BEGIN and the header
+  fit a flash erase. Treat every upload as a flash write, and never refresh content in a loop.
 - **Order matters:** for GIFs send `E5` mode 5 before streaming. For image and text send it after.
 - An `E5` alone does not repaint a wedged framebuffer, and without a genuine mode change it does not
   re-render. That is why `recover` uploads first, and goes through mode 6 if the target is mode 3.
@@ -168,9 +171,16 @@ Positions are big-endian.
 | 7 | Carousel | `0x0A`, a GCC quirk (internal mode 9, plus 1) |
 | 8 | Preset rotation | `0x0B` |
 
-Mode 8 is only this tool's label for raw `0x0B`, which the real 5090 reported at rest. Its behaviour
-is known only from upstream notes on an RTX 5080: a rotation of the built-in screens plus stored user
-content. `DE` reads the carousel back as `0x08` or `0x0A`.
+Mode 8 is only this tool's label for raw `0x0B`, which the real 5090 reported at rest. Upstream notes
+on an RTX 5080 describe it as a rotation of the built-in screens plus stored user content, which fits
+what the 5090 showed after a power loss: the stored text, the stored image, then the built-in
+animation. `DE` reads the carousel back as `0x08` or `0x0A`.
+
+**State after a power loss**, seen once on firmware 1.3: `DE` read mode 8, `DF` read no widgets with
+interval 0, and `F4` bank 1 read `0A 02 00 00`, interval 10 with stat screen 2. The mode and the
+carousel match what this tool read before its first write. The widgets did not: they had been all
+eight every 4 s then, and also just before the power loss. So mode and widgets are RAM state, and
+`AA` did not restore the mode.
 
 ### GIF payload
 
