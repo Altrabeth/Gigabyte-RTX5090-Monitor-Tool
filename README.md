@@ -141,6 +141,9 @@ firmware 1.3, driver 615.78.08, subsystem `1458:416e`, kernel 6.18.
 - `daemon --mode 0`, starting from mode 8 with no widgets: it set mode 0 and the default widgets, and
   both read back right. Its check once a minute undid a `mode 5` and a `dashboard --off` sent from
   another shell.
+- The systemd unit, installed by hand as in [Setup](#setup-on-arch) on 2026-11-07: it started, kept the panel
+  in mode 0 with the default widgets, and took the bus lock about once a second. Its journal stays
+  empty while all goes well, since the service logs only warnings.
 
 **Not verified:**
 
@@ -149,7 +152,8 @@ firmware 1.3, driver 615.78.08, subsystem `1458:416e`, kernel 6.18.
 - `recover` on an actually dark panel, or with `--overlay` or `--clear-overlay`.
 - `--no-overlay`. `E1` itself has reached the real panel over 40 times, from `dashboard` and the
   daemon, with no dark-panel event.
-- The systemd unit and the PKGBUILD have never been installed, because no root was available.
+- The PKGBUILD has never been installed. The systemd unit has been installed and runs, see below, but
+  has not yet been through a boot.
 - Frame-rate effect in real games. The 35 ms driver stall under [Feed cost](#feed-cost) is a proxy.
 - Suspend and resume.
 
@@ -292,6 +296,9 @@ The panel needs regular `E3` frames, and each one is an I2C write while you may 
 - With a 1 Hz feed, other NVIDIA driver calls stalled once per second, for up to 35 ms. With the feed
   off, none stalled over 10 ms in 60 s. This stall is a proxy, measured as `nvmlDeviceGetMemoryInfo`
   latency. It is not a measured game frame drop.
+- The service at 1 Hz used 5.7 s of kernel time and 0.02 s of user time in 153 s, about 3.7% of one
+  CPU core. The driver appears to busy-wait through each transfer. Under load the adaptive feed
+  writes about six times less often.
 
 That is why the default is `--feed adaptive`: a frame every second under 50% GPU usage, and from there
 up a pair of frames about every 6 s, carrying the last 5 s of peaks (temperature, fan, power) and
