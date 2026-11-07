@@ -138,14 +138,17 @@ firmware 1.3, driver 615.78.08, subsystem `1458:416e`, kernel 6.18.
 - `dashboard` with all 8 widgets at 4 s
 - `recover` with default options
 - `save`
+- `daemon --mode 0`, starting from mode 8 with no widgets: it set mode 0 and the default widgets, and
+  both read back right. Its check once a minute undid a `mode 5` and a `dashboard --off` sent from
+  another shell.
 
 **Not verified:**
 
 - What `AA` does in text mode: the `text` run above sent none.
 - Whether the carousel actually plays after `mode 7`, and the unit of its interval.
 - `recover` on an actually dark panel, or with `--overlay` or `--clear-overlay`.
-- `--no-overlay`, and an `E1` sent by the daemon. `E1` has reached the real panel only through the
-  two `dashboard` runs above, with no dark-panel event.
+- `--no-overlay`. `E1` itself has reached the real panel over 40 times, from `dashboard` and the
+  daemon, with no dark-panel event.
 - The systemd unit and the PKGBUILD have never been installed, because no root was available.
 - Frame-rate effect in real games. The 35 ms driver stall under [Feed cost](#feed-cost) is a proxy.
 - Suspend and resume.
@@ -162,9 +165,12 @@ firmware 1.3, driver 615.78.08, subsystem `1458:416e`, kernel 6.18.
 `E3` writes succeeded, with no reconnects and no unexplained mode change. It says nothing about long
 runs under load, and nobody watched the screen for the whole run.
 
-**Open issue:** once the panel reported mode 5 (GIF) after feed tests without any `E5` being sent,
-and neither three later attempts nor the soak test reproduced it. It is unexplained. If it happens, run
-`aorus-lcd mode 0`.
+**Open issue:** twice the panel ended up in mode 5 (GIF) unasked. The first time was from mode 0
+during feed tests, with no `E5` sent. The second was in a daemon run from mode 8: it sent `E5` with
+mode 0 and `E1`, every write succeeded, and the panel still read mode 5 with no widgets, every 0 s.
+Neither the soak test nor 17 attempts to repeat the second case reproduced it. It is unexplained. It
+looks like live stats that have stopped: mode 5 shows the last GIF, here a picture of numbers. With
+`mode` set, the daemon notices within a minute and switches back. Without it, run `aorus-lcd mode 0`.
 
 ## Commands
 
