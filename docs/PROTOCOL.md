@@ -212,7 +212,8 @@ eight every 4 s then, and also just before the power loss. So mode and widgets a
 - The daemon sends only `EB 03`, `DF`, at most 2 `E1` per connection and `E3`, and nothing on
   shutdown. With a `mode` configured it also reads `DE` and sends at most 3 `E5` per connection,
   before `DF`. It reads back each `E5` and `E1` 1 s later, and reads `DE` and `DF` once a minute
-  while feeding. It never sends `AA`.
+  while feeding, every 10 s for the first 2 minutes after a setup at start or after a lost bus.
+  It never sends `AA`.
 - Out of scope: `E1` "brightness", `FA` poweroff mode, the `0x76` LcdEx protocol, RGB, fan control.
 
 ## Source layout

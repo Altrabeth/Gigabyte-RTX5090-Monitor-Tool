@@ -12,8 +12,9 @@
 //!   this module sends: `AA` writes NVRAM. See below for when `E5` and `E1` go
 //!   out.
 //! - **The check:** every [`CHECK_PERIOD`] while feeding, `DE` if a mode is
-//!   configured and `DF` always. A panel that needs an `E5` or `E1` again ends
-//!   the session, and the reconnect sets it up anew. See
+//!   configured and `DF` always, and every [`EARLY_CHECK_PERIOD`] for
+//!   [`EARLY_CHECK_WINDOW`] after most setups. A panel that needs an `E5` or
+//!   `E1` again ends the session, and the reconnect sets it up anew. See
 //!   [below](self#the-check-once-a-minute).
 //! - **Ticks** run on deadlines, each the previous one plus [`TICK`], so the
 //!   time spent working does not add up. A missed deadline is dropped rather
@@ -86,7 +87,7 @@
 //!
 //! # The check once a minute
 //!
-//! The panel has twice switched to mode 5 with nobody asking, and widgets can
+//! The panel has three times switched to mode 5 with nobody asking, and widgets can
 //! vanish, and neither makes a write fail, so nothing else would notice. So every
 //! [`CHECK_PERIOD`] on the feed's clock, between two ticks, the daemon reads `DE`
 //! if a mode is configured, and `DF` always. It decides as a connection does,
@@ -101,6 +102,21 @@
 //! reconnects with the normal backoff. These have a count of their own, apart
 //! from failed `E3`, because a good `E3` in between says nothing about whether
 //! the panel answers reads. A dry-run has no read-backs, so it has no check.
+//!
+//! ## Early checks
+//!
+//! Two of the three unasked switches to mode 5 came soon after a setup whose
+//! `E5` and `E1` had both read back right: one within 11 s, one found by the
+//! first check 61 s in. Until the check finds it, the panel shows its stored
+//! GIF, which on this card is a picture of numbers and looks like frozen stats.
+//! So for [`EARLY_CHECK_WINDOW`] after a setup the check runs every
+//! [`EARLY_CHECK_PERIOD`], and every [`CHECK_PERIOD`] from there.
+//!
+//! This follows the daemon's start and a lost bus, not a check that found the
+//! panel changed. A panel that keeps changing right after each setup then costs
+//! one extra setup, not one every [`EARLY_CHECK_PERIOD`]. The warning says how
+//! many seconds after the setup the change was found, to tell when these
+//! switches happen.
 //!
 //! # Why a failed write waits for the next tick
 //!
@@ -243,6 +259,13 @@ pub const DASHBOARD_ATTEMPTS: u32 = 2;
 
 /// The time between two checks of the mode and widgets while feeding.
 pub const CHECK_PERIOD: Duration = Duration::from_secs(60);
+
+/// The time between two checks during [`EARLY_CHECK_WINDOW`]. See the
+/// [module docs](self#early-checks).
+pub const EARLY_CHECK_PERIOD: Duration = Duration::from_secs(10);
+
+/// How long after a setup the check runs every [`EARLY_CHECK_PERIOD`].
+pub const EARLY_CHECK_WINDOW: Duration = Duration::from_secs(120);
 
 /// How often `E3` goes out. See the [module docs](self#the-adaptive-feed).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -875,14 +898,16 @@ where
     fn run(&mut self) -> Result<()> {
         // The first attempt goes at once. After a failure the bus gets a moment.
         let mut wait_first = false;
+        // Early checks follow the start and a lost bus, not a stale panel.
+        let mut early = true;
         while !self.out_of_ticks() {
             let Some((link, pci_bus)) = self.establish(wait_first)? else {
                 break;
             };
-            match self.feed(link, pci_bus)? {
+            match self.feed(link, pci_bus, early)? {
                 Ended::Stopped => break,
-                Ended::BusLost => wait_first = true,
-                Ended::Stale => wait_first = false,
+                Ended::BusLost => (wait_first, early) = (true, true),
+                Ended::Stale => (wait_first, early) = (false, false),
             }
         }
         Ok(())
@@ -1043,13 +1068,19 @@ where
     }
 
     /// Ticks until the session ends. The first deadline is now: the panel has
-    /// waited long enough.
-    fn feed(&mut self, mut link: Link<T, W>, pci_bus: Option<u32>) -> Result<Ended> {
-        let mut deadline = self.clock.now();
+    /// waited long enough. `early` asks for [early checks](self#early-checks).
+    fn feed(&mut self, mut link: Link<T, W>, pci_bus: Option<u32>, early: bool) -> Result<Ended> {
+        let started = self.clock.now();
+        let mut deadline = started;
         let mut failures = 0;
         let mut schedule = FeedSchedule::new(self.config.strategy);
         let mut explained = false;
-        let mut next_check = deadline + CHECK_PERIOD;
+        let early_until = early.then(|| started + EARLY_CHECK_WINDOW);
+        let check_period = |now: Instant| match early_until {
+            Some(until) if now < until => EARLY_CHECK_PERIOD,
+            _ => CHECK_PERIOD,
+        };
+        let mut next_check = started + check_period(started);
         let mut failed_checks = 0;
         while !self.out_of_ticks() && self.wait_until(deadline) {
             let sample = self.sensors.sample(self.clock.now(), pci_bus);
@@ -1089,9 +1120,11 @@ where
                 self.write_cost.report();
             }
             if self.clock.now() >= next_check {
-                match self.check(&mut link, &mut failed_checks)? {
+                let since_setup = self.clock.now().saturating_duration_since(started);
+                match self.check(&mut link, &mut failed_checks, since_setup)? {
                     Checked::Done => {
-                        next_check = next_after(next_check, self.clock.now(), CHECK_PERIOD);
+                        let now = self.clock.now();
+                        next_check = next_after(next_check, now, check_period(now));
                     }
                     Checked::Again => {}
                     Checked::End(ended) => return Ok(ended),
@@ -1103,15 +1136,20 @@ where
     }
 
     /// Runs [the check](self#the-check-once-a-minute). `failed` counts the checks
-    /// in a row whose reads failed.
-    fn check(&mut self, link: &mut Link<T, W>, failed: &mut u32) -> Result<Checked> {
+    /// in a row whose reads failed, and `since_setup` goes into the warning.
+    fn check(
+        &mut self,
+        link: &mut Link<T, W>,
+        failed: &mut u32,
+        since_setup: Duration,
+    ) -> Result<Checked> {
         match link.check(&self.config) {
             Ok(None) => {
                 *failed = 0;
                 Ok(Checked::Done)
             }
             Ok(Some(found)) => {
-                log::warn!("check: {found}: setting the panel up again");
+                log::warn!("{}", check_warning(&found, since_setup));
                 Ok(Checked::End(Ended::Stale))
             }
             Err(Error::LockBusy { .. }) => {
@@ -1157,6 +1195,13 @@ where
     fn is_fatal(&self, error: &Error) -> bool {
         self.dry_run || waiting_cannot_cure(error)
     }
+}
+
+/// The check's warning, such as `check: panel is in mode 5 (raw 0x06), 34 s
+/// after setup: setting the panel up again`. Whole seconds, rounded down.
+fn check_warning(found: &str, since_setup: Duration) -> String {
+    let seconds = since_setup.as_secs();
+    format!("check: {found}, {seconds} s after setup: setting the panel up again")
 }
 
 /// Logs what the panel has and what happens to it.

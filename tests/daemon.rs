@@ -20,7 +20,8 @@ use aorus_lcd::bus::transport::{DryRun, Transport};
 use aorus_lcd::daemon::{
     run_with, Clock, DaemonConfig, Environment, FeedStrategy, UntilStopped, ADAPTIVE_BUSY_PERCENT,
     ADAPTIVE_PAIR_GAP_TICKS, ADAPTIVE_WINDOW_POLLS, CHECK_PERIOD, DASHBOARD_ATTEMPTS,
-    MODE_ATTEMPTS, POLL_SLICE, SETTLE, WRITE_ATTEMPTS, WRITE_COST_REPORT_TICKS,
+    EARLY_CHECK_PERIOD, EARLY_CHECK_WINDOW, MODE_ATTEMPTS, POLL_SLICE, SETTLE, TICK,
+    WRITE_ATTEMPTS, WRITE_COST_REPORT_TICKS,
 };
 use aorus_lcd::panel::Sleep;
 use aorus_lcd::protocol::{
@@ -600,6 +601,25 @@ struct Setup {
     mode_checked: bool,
     /// The check found the panel needing a new setup, so only a probe may follow.
     stale: bool,
+    /// This connection may check every [`EARLY_CHECK_PERIOD`] at first.
+    early: bool,
+}
+
+impl Setup {
+    /// The least time from a check at `at` to the next.
+    fn period_after(&self, at: u64) -> u64 {
+        let configured_at = self.configured_at.expect("a check after the setup");
+        // The window runs from the start of the feed, which can come a little
+        // after the setup's last read.
+        let window = EARLY_CHECK_WINDOW + TICK;
+        let early = self.early && ms(at) < ms(configured_at) + window;
+        let period = if early {
+            EARLY_CHECK_PERIOD
+        } else {
+            CHECK_PERIOD
+        };
+        period.as_millis() as u64
+    }
 }
 
 /// The rules of the wire, over a whole trace. Failed attempts count: a frame that
@@ -621,7 +641,9 @@ struct Setup {
 /// - `E3` only once that is done.
 /// - Then the check: no sooner than [`CHECK_PERIOD`] after the setup and after
 ///   the last check, a `DE` if a mode is configured and then a `DF`. If either
-///   calls for a new setup, nothing but a probe follows.
+///   calls for a new setup, nothing but a probe follows. During
+///   [`EARLY_CHECK_WINDOW`], [`EARLY_CHECK_PERIOD`] instead, unless the last
+///   connection that got set up ended on a check that called for a new setup.
 fn assert_allowed_frames(trace: &[Sent], config: DaemonConfig) {
     let wanted = config.dashboard();
     let dashboard = display_frame(wanted.elements, wanted.interval_s);
@@ -630,9 +652,11 @@ fn assert_allowed_frames(trace: &[Sent], config: DaemonConfig) {
         None => panel.elements == Elements::NONE,
     };
     let needs_e5 = |raw_mode: u8| ModeStatus { raw_mode, on: true }.mode() != config.mode;
-    let period = CHECK_PERIOD.as_millis() as u64;
     let settle = SETTLE.as_millis() as u64;
-    let mut setup = Setup::default();
+    let mut setup = Setup {
+        early: true,
+        ..Setup::default()
+    };
     let mut prev: Option<&Sent> = None;
     for sent in trace {
         if sent.opcode() != PROBE {
@@ -641,7 +665,16 @@ fn assert_allowed_frames(trace: &[Sent], config: DaemonConfig) {
         match sent.opcode() {
             PROBE => {
                 assert_eq!(sent.frame[..], probe_frame()[..], "not EB 03");
-                setup = Setup::default();
+                // A connection that never got set up never fed, so it
+                // changes nothing about the next one's checks.
+                let early = match setup.configured_at {
+                    Some(_) => !setup.stale,
+                    None => setup.early,
+                };
+                setup = Setup {
+                    early,
+                    ..Setup::default()
+                };
             }
             MODE_QUERY => {
                 assert!(
@@ -693,7 +726,8 @@ fn assert_allowed_frames(trace: &[Sent], config: DaemonConfig) {
                     };
                     if sent.ok && done {
                         setup.configured_at = Some(sent.at);
-                        setup.check_from = sent.at + period;
+                        setup.check_from = sent.at;
+                        setup.check_from += setup.period_after(sent.at);
                     }
                 } else {
                     let due = match config.mode {
@@ -704,7 +738,7 @@ fn assert_allowed_frames(trace: &[Sent], config: DaemonConfig) {
                     setup.mode_checked = false;
                     if sent.ok {
                         setup.stale = needs_e1(sent.panel);
-                        setup.check_from += period;
+                        setup.check_from += setup.period_after(sent.at);
                     }
                 }
             }
@@ -2644,38 +2678,51 @@ fn an_upload_during_the_settle_ends_the_connection_and_the_next_finds_the_mode_s
     assert_allowed_frames(&rig.trace(), config);
 }
 
-/// The ticks that reach just past the first check, at 60 s.
-const PAST_THE_CHECK: u64 = 61;
+/// The ticks that reach just past the first check, at 10 s.
+const PAST_THE_CHECK: u64 = 11;
+
+/// When a first session checks: every 10 s up to 2 min, then every minute.
+fn early_checks_then(later: &[u64]) -> Vec<u64> {
+    let early = (10_000..=120_000).step_by(10_000);
+    early.chain(later.iter().copied()).collect()
+}
 
 #[test]
-fn there_is_no_check_before_60_seconds() {
+fn a_first_session_checks_every_10_s_for_two_minutes_then_once_a_minute() {
+    assert_eq!(EARLY_CHECK_PERIOD, Duration::from_secs(10));
+    assert_eq!(EARLY_CHECK_WINDOW, Duration::from_secs(120));
     assert_eq!(CHECK_PERIOD, Duration::from_secs(60));
     let rig = Rig::new();
     rig.panel_in_mode(RAW_STATS);
+    let config = in_mode_0(Some(241));
 
-    rig.run_configured(in_mode_0(Some(60)), healthy).unwrap();
+    rig.run_configured(config, healthy).unwrap();
 
-    assert_eq!(rig.attempts(MODE_QUERY), [0]);
-    assert_eq!(rig.attempts(READ_BACK), [0]);
-    assert_eq!(rig.delivered(FEED).last(), Some(&59_000));
+    let checks = early_checks_then(&[180_000, 240_000]);
+    let setup_and_checks = [&[0][..], &checks].concat();
+    assert_eq!(rig.attempts(MODE_QUERY), setup_and_checks);
+    assert_eq!(rig.attempts(READ_BACK), setup_and_checks);
+    assert_eq!(rig.attempts(PROBE), [0]);
+    assert_eq!(rig.delivered(FEED).last(), Some(&240_000));
+    assert_allowed_frames(&rig.trace(), config);
 }
 
 #[test]
 fn the_check_reads_de_and_df_between_ticks_under_the_lock() {
     let rig = Rig::new();
     rig.panel_in_mode(RAW_STATS);
-    let config = in_mode_0(Some(PAST_THE_CHECK + 60));
+    let config = in_mode_0(Some(PAST_THE_CHECK + 10));
 
     rig.run_configured(config, healthy).unwrap();
 
-    assert_eq!(rig.attempts(MODE_QUERY), [0, 60_000, 120_000]);
-    assert_eq!(rig.attempts(READ_BACK), [0, 60_000, 120_000]);
+    assert_eq!(rig.attempts(MODE_QUERY), [0, 10_000, 20_000]);
+    assert_eq!(rig.attempts(READ_BACK), [0, 10_000, 20_000]);
     assert_eq!(rig.attempts(PROBE), [0]);
     assert_eq!(rig.attempts(SET_MODE), []);
     let trace = rig.trace();
     let check = trace
         .iter()
-        .position(|sent| sent.at == 60_000 && sent.opcode() == MODE_QUERY);
+        .position(|sent| sent.at == 10_000 && sent.opcode() == MODE_QUERY);
     let check = check.unwrap();
     assert_eq!(
         trace[check - 1].opcode(),
@@ -2694,7 +2741,7 @@ fn without_a_mode_the_check_reads_no_de() {
     rig.ticks(PAST_THE_CHECK).unwrap();
 
     assert_eq!(rig.attempts(MODE_QUERY), []);
-    assert_eq!(rig.attempts(READ_BACK), [0, 60_000]);
+    assert_eq!(rig.attempts(READ_BACK), [0, 10_000]);
     assert_only_allowed_frames(&rig.trace());
 }
 
@@ -2706,21 +2753,61 @@ fn the_check_finds_a_changed_mode_and_sets_the_panel_up_again() {
     // An unexplained flip to mode 5, the stored GIF.
     let device = rig.device.clone();
     rig.clock.at(30_500, move || device.mode.set(0x06));
-    let config = in_mode_0(Some(PAST_THE_CHECK + 1));
+    let config = in_mode_0(Some(42));
 
     rig.run_configured(config, healthy).unwrap();
 
     // The reconnect goes at once: no backoff.
-    assert_eq!(rig.attempts(PROBE), [0, 60_000]);
-    assert_eq!(rig.attempts(MODE_QUERY), [0, 60_000, 60_000, 61_000]);
-    assert_eq!(rig.attempts(SET_MODE), [60_000]);
+    assert_eq!(rig.attempts(PROBE), [0, 40_000]);
+    let checks = [10_000, 20_000, 30_000, 40_000];
+    let reads = [&[0][..], &checks, &[40_000, 41_000]].concat();
+    assert_eq!(rig.attempts(MODE_QUERY), reads);
+    assert_eq!(rig.attempts(SET_MODE), [40_000]);
     assert_eq!(rig.device.mode.get(), RAW_STATS);
-    assert_eq!(rig.delivered(FEED)[60..], [60_000, 61_000]);
+    assert_eq!(rig.delivered(FEED)[40..], [40_000, 41_000]);
     assert_eq!(
         logged(Level::Warn, "check"),
-        ["check: panel is in mode 5 (raw 0x06): setting the panel up again"]
+        ["check: panel is in mode 5 (raw 0x06), 40 s after setup: setting the panel up again"]
     );
     assert_allowed_frames(&rig.trace(), config);
+}
+
+#[test]
+fn a_session_after_a_stale_panel_checks_only_once_a_minute() {
+    let rig = Rig::new();
+    rig.panel_in_mode(RAW_STATS);
+    let device = rig.device.clone();
+    rig.clock.at(30_500, move || device.mode.set(0x06));
+    // Up to the tick at 161 s, in the second session.
+    let config = in_mode_0(Some(41 + 121));
+
+    rig.run_configured(config, healthy).unwrap();
+
+    // The second session is set up by 41 s, after the settle of its E5.
+    assert_eq!(rig.attempts(PROBE), [0, 40_000]);
+    let checks = [10_000, 20_000, 30_000, 40_000];
+    let setup = [40_000, 41_000];
+    let reads = [&[0][..], &checks, &setup, &[101_000, 161_000]].concat();
+    assert_eq!(rig.attempts(MODE_QUERY), reads);
+    assert_eq!(rig.delivered(FEED).last(), Some(&161_000));
+    assert_allowed_frames(&rig.trace(), config);
+}
+
+#[test]
+fn a_session_after_a_lost_bus_checks_early_again() {
+    let rig = Rig::new();
+    // Three failed writes in a row, at 31, 32 and 33 s, end the session.
+    rig.outage(30_500, 33_500);
+
+    rig.ticks(31 + 3 + 21).unwrap();
+
+    // The second session starts after the backoff, at 35 s.
+    assert_eq!(rig.attempts(PROBE), [0, 35_000]);
+    let first = [10_000, 20_000, 30_000];
+    let second = [35_000, 45_000, 55_000];
+    let reads = [&[0][..], &first, &second].concat();
+    assert_eq!(rig.attempts(READ_BACK), reads);
+    assert_only_allowed_frames(&rig.trace());
 }
 
 #[test]
@@ -2730,15 +2817,17 @@ fn the_check_finds_vanished_widgets_and_sets_the_panel_up_again() {
     let device = rig.device.clone();
     rig.clock.at(30_500, move || device.panel.set((0, 0)));
 
-    rig.ticks(PAST_THE_CHECK + 1).unwrap();
+    rig.ticks(42).unwrap();
 
-    assert_eq!(rig.attempts(PROBE), [0, 60_000]);
-    assert_eq!(rig.attempts(READ_BACK), [0, 60_000, 60_000, 61_000]);
-    assert_eq!(rig.attempts(DASHBOARD), [60_000]);
+    assert_eq!(rig.attempts(PROBE), [0, 40_000]);
+    let checks = [10_000, 20_000, 30_000, 40_000];
+    let reads = [&[0][..], &checks, &[40_000, 41_000]].concat();
+    assert_eq!(rig.attempts(READ_BACK), reads);
+    assert_eq!(rig.attempts(DASHBOARD), [40_000]);
     assert_eq!(rig.device.panel.get(), (DEFAULT_MASK, DEFAULT_INTERVAL));
     assert_eq!(
         logged(Level::Warn, "check"),
-        ["check: panel has widgets 0x00 every 0 s: setting the panel up again"]
+        ["check: panel has widgets 0x00 every 0 s, 40 s after setup: setting the panel up again"]
     );
     assert_only_allowed_frames(&rig.trace());
 }
@@ -2747,7 +2836,7 @@ fn the_check_finds_vanished_widgets_and_sets_the_panel_up_again() {
 fn the_check_leaves_other_widgets_alone_when_none_are_named() {
     let rig = Rig::new();
     let device = rig.device.clone();
-    rig.clock.at(30_500, move || device.panel.set((0xFF, 4)));
+    rig.clock.at(5_500, move || device.panel.set((0xFF, 4)));
 
     rig.ticks(PAST_THE_CHECK).unwrap();
 
@@ -2758,11 +2847,11 @@ fn the_check_leaves_other_widgets_alone_when_none_are_named() {
 #[test]
 fn the_check_is_skipped_while_an_upload_holds_the_bus() {
     let rig = Rig::new();
-    rig.upload(59_500, 60_500);
+    rig.upload(19_500, 20_500);
 
-    rig.ticks(PAST_THE_CHECK + 60).unwrap();
+    rig.ticks(31).unwrap();
 
-    assert_eq!(rig.attempts(READ_BACK), [0, 120_000]);
+    assert_eq!(rig.attempts(READ_BACK), [0, 10_000, 30_000]);
     assert_eq!(rig.attempts(PROBE), [0]);
     assert_only_allowed_frames(&rig.trace());
 }
@@ -2770,12 +2859,12 @@ fn the_check_is_skipped_while_an_upload_holds_the_bus() {
 #[test]
 fn a_failed_check_is_tried_again_after_the_next_tick() {
     let rig = Rig::new();
-    rig.read_fault(59_500, 60_500, READ_BACK, short_read);
+    rig.read_fault(19_500, 20_500, READ_BACK, short_read);
 
-    rig.ticks(PAST_THE_CHECK + 60).unwrap();
+    rig.ticks(31).unwrap();
 
-    // Retried at 61 s, and from there the next one is due a period after 60 s.
-    assert_eq!(rig.attempts(READ_BACK), [0, 60_000, 61_000, 120_000]);
+    // Retried at 21 s, and from there the next one is due a period after 20 s.
+    assert_eq!(rig.attempts(READ_BACK), [0, 10_000, 20_000, 21_000, 30_000]);
     assert_eq!(rig.attempts(PROBE), [0]);
     assert_only_allowed_frames(&rig.trace());
 }
@@ -2783,20 +2872,21 @@ fn a_failed_check_is_tried_again_after_the_next_tick() {
 #[test]
 fn three_failed_checks_in_a_row_end_the_session_even_with_good_writes_between() {
     let rig = Rig::new();
-    rig.read_fault(59_500, 62_500, READ_BACK, short_read);
+    rig.read_fault(19_500, 22_500, READ_BACK, short_read);
 
-    rig.ticks(PAST_THE_CHECK + 3).unwrap();
+    rig.ticks(24).unwrap();
 
-    assert_eq!(rig.attempts(READ_BACK), [0, 60_000, 61_000, 62_000, 64_000]);
-    assert_eq!(rig.delivered(FEED)[60..], [60_000, 61_000, 62_000, 64_000]);
-    assert_eq!(rig.attempts(PROBE), [0, 64_000]);
+    let reads = [0, 10_000, 20_000, 21_000, 22_000, 24_000];
+    assert_eq!(rig.attempts(READ_BACK), reads);
+    assert_eq!(rig.delivered(FEED)[20..], [20_000, 21_000, 22_000, 24_000]);
+    assert_eq!(rig.attempts(PROBE), [0, 24_000]);
     assert_only_allowed_frames(&rig.trace());
 }
 
 #[test]
 fn a_permission_error_in_the_check_is_fatal() {
     let rig = Rig::new();
-    rig.read_fault(59_500, 60_500, READ_BACK, || errno_error(Errno::ACCESS));
+    rig.read_fault(9_500, 10_500, READ_BACK, || errno_error(Errno::ACCESS));
 
     let error = rig.ticks(PAST_THE_CHECK + 5).unwrap_err();
 
@@ -2811,8 +2901,9 @@ fn a_panel_that_never_takes_e5_is_set_up_again_once_a_minute() {
 
     rig.run_configured(config, healthy).unwrap();
 
-    // Each round: three E5 a settle apart, the feed, and a check a minute later.
-    assert_eq!(rig.attempts(PROBE), [0, 63_000, 126_000]);
+    // Each round: three E5 a settle apart, the feed, and a check. The first
+    // session checks after 10 s, and the ones after it once a minute.
+    assert_eq!(rig.attempts(PROBE), [0, 13_000, 76_000]);
     assert_eq!(rig.attempts(SET_MODE).len(), 9);
     assert_allowed_frames(&rig.trace(), config);
 }

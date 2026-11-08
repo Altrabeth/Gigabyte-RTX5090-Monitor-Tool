@@ -90,7 +90,9 @@ It reads the mode back a second later and tries again, up to 3 `E5` in all. Sinc
 survive the power loss, `E5` looks like RAM only, so this should cause no wear.
 
 With `mode` set, the daemon keeps that mode. It reads the mode once a minute, so a mode set by hand
-with `aorus-lcd mode`, or by an upload, is switched back within about a minute. To show other
+with `aorus-lcd mode`, or by an upload, is switched back within about a minute. For the first two
+minutes after it sets the panel up at start or after a lost bus, it reads every 10 s instead,
+because the panel has switched to mode 5 by itself soon after a setup. To show other
 content, stop the daemon or leave `mode` out. The same check reads the widgets, and puts them back
 if they vanish.
 
@@ -186,7 +188,9 @@ The soak test did not reproduce it. Neither did 17 tries to repeat the second ca
 watched the panel for only about 3 s. Six later tries, each from mode 8 through the service's setup
 and watched every 2 s for 90 to 130 s, did not reproduce it either. It is unexplained. It looks like
 live stats that have stopped: mode 5 shows the last GIF, here a picture of numbers. With `mode` set,
-the daemon notices within a minute and switches back. Without it, run `aorus-lcd mode 0`.
+the daemon notices and switches back within a minute, or within 10 s during the first two minutes
+after it starts or regains the bus. Its warning says how many seconds after the setup it found the
+change. Without `mode`, run `aorus-lcd mode 0`.
 
 ## Commands
 
@@ -288,13 +292,14 @@ before it touches the bus. See [`dist/aorus-lcd.toml`](dist/aorus-lcd.toml).
 | `feed` | `--feed` | `"adaptive"` or `"steady"` | `"adaptive"` |
 | `frame_bytes` | `--frame-bytes` | 256 or 128 | 256 |
 | `bus` | `--bus` | An NVIDIA adapter's bus number | Autodetect |
-| `mode` | `--mode` | A display mode, 0 to 8, as for `aorus-lcd mode`. Kept: checked once a minute. | Leave the mode alone |
+| `mode` | `--mode` | A display mode, 0 to 8, as for `aorus-lcd mode`. Kept: checked once a minute, and every 10 s for two minutes after a setup. | Leave the mode alone |
 
 The daemon sends `E1` only if the panel needs it, so a config that names no widgets keeps the panel's
 selection and interval. The exception is a panel with no widget enabled, which gets the defaults
 above. With `widgets` set, `E1` goes out on connect whenever the panel's widgets or interval differ.
 Each `E1` is read back a second later, with at most 2 per connection, and once a minute the daemon
-reads the widgets and sets the panel up again if they call for an `E1`.
+reads the widgets and sets the panel up again if they call for an `E1`. For the first two minutes
+after it starts or regains the bus, it reads them every 10 s.
 `E1` has been sent to this panel twice with no dark-panel event, but it is still the prime suspect
 in upstream's dark-panel incidents. The daemon avoids it unless needed, so leave `widgets` out unless
 you need it.
