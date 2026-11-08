@@ -10,9 +10,9 @@ url="https://github.com/Altrabeth/$_repo"
 # The binary embeds DejaVu Sans Bold, so the font's terms apply to it as well as
 # MIT. SPDX has an id for Bitstream Vera but none for Arev, hence the LicenseRef.
 license=('MIT' 'Bitstream-Vera' 'LicenseRef-Arev')
-# nvidia-utils only at run time: NVML is loaded with dlopen, so it never shows up
-# as a linked library.
-depends=('gcc-libs' 'glibc' 'nvidia-utils')
+# libgcc and glibc are what the binary links. nvidia-utils is needed at run time
+# only: NVML is loaded with dlopen, so namcap reports it as possibly unneeded.
+depends=('glibc' 'libgcc' 'nvidia-utils')
 makedepends=('cargo')
 # Cargo's profile already strips the binary, so a debug package has no symbols.
 options=('!debug')
@@ -68,4 +68,15 @@ package() {
 
   install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" \
     LICENSE assets/DejaVuSans-Bold.LICENSE
+
+  # namcap wants a file for each license identifier that pacman does not ship.
+  # The DejaVu file covers Bitstream-Vera and Arev, so its Arev section also
+  # goes in a file of its own, word for word.
+  sed -n '/^Arev Fonts Copyright$/,/^TeX Gyre DJV Math$/p' assets/DejaVuSans-Bold.LICENSE |
+    sed '$d' > "$srcdir/LicenseRef-Arev"
+  if ! grep -q 'Copyright (c) 2006 by Tavmjong Bah' "$srcdir/LicenseRef-Arev"; then
+    echo 'package: failed to extract the Arev section of the DejaVu license' >&2
+    return 1
+  fi
+  install -Dm644 "$srcdir/LicenseRef-Arev" "$pkgdir/usr/share/licenses/$pkgname/LicenseRef-Arev"
 }
