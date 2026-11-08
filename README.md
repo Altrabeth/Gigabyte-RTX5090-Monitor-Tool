@@ -90,7 +90,9 @@ It reads the mode back a second later and tries again, up to 3 `E5` in all. Sinc
 survive the power loss, `E5` looks like RAM only, so this should cause no wear.
 
 With `mode` set, the daemon keeps that mode. It reads the mode once a minute, so a mode set by hand
-with `aorus-lcd mode`, or by an upload, is switched back within about a minute. To show other
+with `aorus-lcd mode`, or by an upload, is switched back within about a minute. For the first two
+minutes after it sets the panel up at start or after a lost bus, it reads every 10 s instead,
+because the panel has switched to mode 5 by itself soon after a setup. To show other
 content, stop the daemon or leave `mode` out. The same check reads the widgets, and puts them back
 if they vanish.
 
