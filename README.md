@@ -149,6 +149,9 @@ firmware 1.3, driver 615.78.08, subsystem `1458:416e`, kernel 6.18.
   boot, 5 s after the kernel, and set the panel up from its power-on state. Its first check found the
   panel in mode 5 and set it up again, see the open issue below. Then it ran through a gaming session,
   and the user noticed no stutter. That is by feel, not a frame-time measurement.
+- The early check: 22 s after the service restarted with it, a `mode 8` sent from another shell was
+  switched back 8 s later, and the warning read `check: panel is in mode 8 (raw 0x0B), 30 s after
+  setup: setting the panel up again`.
 
 **Not verified:**
 
