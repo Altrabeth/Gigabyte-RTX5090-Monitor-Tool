@@ -143,7 +143,10 @@ firmware 1.3, driver 615.78.08, subsystem `1458:416e`, kernel 6.18.
   another shell.
 - The systemd unit, installed by hand as in [Setup](#setup-on-arch) on 2026-11-07: it started, kept the panel
   in mode 0 with the default widgets, and took the bus lock about once a second. Its journal stays
-  empty while all goes well, since the service logs only warnings.
+  empty while all goes well, since the service logs only warnings. On 2026-11-08 it came up with a
+  boot, 5 s after the kernel, and set the panel up from its power-on state. Its first check found the
+  panel in mode 5 and set it up again, see the open issue below. Then it ran through a gaming session,
+  and the user noticed no stutter. That is by feel, not a frame-time measurement.
 
 **Not verified:**
 
@@ -152,9 +155,9 @@ firmware 1.3, driver 615.78.08, subsystem `1458:416e`, kernel 6.18.
 - `recover` on an actually dark panel, or with `--overlay` or `--clear-overlay`.
 - `--no-overlay`. `E1` itself has reached the real panel over 40 times, from `dashboard` and the
   daemon, with no dark-panel event.
-- The PKGBUILD has never been installed. The systemd unit has been installed and runs, see below, but
-  has not yet been through a boot.
-- Frame-rate effect in real games. The 35 ms driver stall under [Feed cost](#feed-cost) is a proxy.
+- The PKGBUILD has never been installed. The systemd unit was installed by hand, see above.
+- Frame-rate effect in real games, as a number. The 35 ms driver stall under [Feed cost](#feed-cost)
+  is a proxy, and one gaming session felt smooth.
 - Suspend and resume.
 
 **After a power loss**, from one shutdown on 2026-11-06:
@@ -169,12 +172,21 @@ firmware 1.3, driver 615.78.08, subsystem `1458:416e`, kernel 6.18.
 `E3` writes succeeded, with no reconnects and no unexplained mode change. It says nothing about long
 runs under load, and nobody watched the screen for the whole run.
 
-**Open issue:** twice the panel ended up in mode 5 (GIF) unasked. The first time was from mode 0
-during feed tests, with no `E5` sent. The second was in a daemon run from mode 8: it sent `E5` with
-mode 0 and `E1`, every write succeeded, and the panel still read mode 5 with no widgets, every 0 s.
-Neither the soak test nor 17 attempts to repeat the second case reproduced it. It is unexplained. It
-looks like live stats that have stopped: mode 5 shows the last GIF, here a picture of numbers. With
-`mode` set, the daemon notices within a minute and switches back. Without it, run `aorus-lcd mode 0`.
+**Open issue:** three times the panel ended up in mode 5 (GIF) unasked:
+
+1. 2026-11-05, from mode 0 during feed tests, with no `E5` sent. The widgets stayed set.
+2. 2026-11-07, a daemon run from mode 8. It sent `E5` with mode 0 and `E1`, every write succeeded,
+   and within 11 s the panel read mode 5 with no widgets, every 0 s.
+3. 2026-11-08, the systemd unit at boot. It set the panel up from its power-on state, mode 8, and both
+   read-backs were right. Its first check, 61 s later, found mode 5. About 35 s before that check, KDE
+   Plasma's power management had scanned all I2C buses through `libddcutil`, as it does at each login.
+   Nothing like that is in the log around the first two, so this is a lead at most.
+
+The soak test did not reproduce it. Neither did 17 tries to repeat the second case, though each
+watched the panel for only about 3 s. Six later tries, each from mode 8 through the service's setup
+and watched every 2 s for 90 to 130 s, did not reproduce it either. It is unexplained. It looks like
+live stats that have stopped: mode 5 shows the last GIF, here a picture of numbers. With `mode` set,
+the daemon notices within a minute and switches back. Without it, run `aorus-lcd mode 0`.
 
 ## Commands
 
@@ -298,7 +310,8 @@ The panel needs regular `E3` frames, and each one is an I2C write while you may 
   latency. It is not a measured game frame drop.
 - The service at 1 Hz used 5.7 s of kernel time and 0.02 s of user time in 153 s, about 3.7% of one
   CPU core. The driver appears to busy-wait through each transfer. Under load the adaptive feed
-  writes about six times less often.
+  writes about six times less often. Over its first 1 h 42 min after a boot, gaming included, the
+  service averaged about 2.1%.
 
 That is why the default is `--feed adaptive`: a frame every second under 50% GPU usage, and from there
 up a pair of frames about every 6 s, carrying the last 5 s of peaks (temperature, fan, power) and
