@@ -47,8 +47,8 @@ pub struct Args {
     pub feed: Option<FeedStrategy>,
 
     /// Display mode to keep, as for `aorus-lcd mode`: E5 goes out on connect when
-    /// the panel is in another mode, and the mode is read again once a minute, so a
-    /// mode set by hand is switched back. The panel forgets its mode on a power
+    /// the panel is in another mode, and the mode is read again once a minute (every
+    /// 10 s for two minutes after a setup), so a mode set by hand is switched back. The panel forgets its mode on a power
     /// loss, and save does not keep it. Without this the mode is left alone
     #[arg(long, value_name = "0-8", value_parser = parse_mode)]
     pub mode: Option<Mode>,

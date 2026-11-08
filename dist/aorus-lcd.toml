@@ -11,7 +11,8 @@
 # incidents. With widgets set, the daemon sends E1 whenever the panel differs
 # from widgets and interval, so a panel with another interval is changed too.
 # Each E1 is read back a second later, with at most 2 per connection, and the
-# daemon reads the widgets once a minute and sets them again if they changed.
+# daemon reads the widgets once a minute, every 10 s for the first two minutes
+# after it starts or regains the bus, and sets them again if they changed.
 #widgets = "temp,clock,usage,fan,vram,power"
 
 # Seconds before the panel rotates to the next widget, 1 to 255. Without it,
@@ -40,7 +41,8 @@
 # The display mode to keep, 0 to 8, as for `aorus-lcd mode`: 0 to 2 are the stat
 # screens. Each time the daemon connects, it reads the mode and sends E5 only if
 # the panel is in another one, then reads it back a second later, with up to 3 E5
-# in all. It reads the mode again once a minute and sets it again if it changed.
+# in all. It reads the mode again once a minute, every 10 s for the first two
+# minutes after it starts or regains the bus, and sets it again if it changed.
 #
 # The panel forgets its mode on a power loss and starts in mode 8, the preset
 # rotation, which shows the stats only part of the time. `aorus-lcd save` does not
