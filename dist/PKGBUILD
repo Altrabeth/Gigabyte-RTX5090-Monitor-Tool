@@ -19,9 +19,7 @@ options=('!debug')
 backup=('etc/aorus-lcd.toml')
 install=aorus-lcd.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# Placeholder: the v0.1.0 tag does not exist yet. Replace this with the tarball's
-# real checksum (updpkgsums) once it does, before publishing.
-sha256sums=('SKIP')
+sha256sums=('651455f0b6f003a183460ca3056f0cf657861424383b76319700d29588567f3f')
 
 prepare() {
   cd "$_repo-$pkgver"
@@ -40,8 +38,8 @@ check() {
   cd "$_repo-$pkgver"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
-  # These never touch hardware, but they read /etc/aorus-lcd.toml if it exists,
-  # so a broken one on the build machine fails them.
+  # These never touch hardware or read /etc/aorus-lcd.toml, so they pass on any
+  # build machine, with or without the card.
   cargo test --release --locked --offline
 }
 

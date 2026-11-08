@@ -98,20 +98,35 @@ if they vanish.
 
 ### Package
 
-[`dist/PKGBUILD`](dist/PKGBUILD) builds a package from the `v0.1.0` tag, but that tag does not exist
-yet and nothing is on the AUR, so the manual install is the only route for now. The PKGBUILD has
-never been installed.
+[`dist/PKGBUILD`](dist/PKGBUILD) builds a package from the `v0.1.0` tag. Nothing is on the AUR. To
+build it outside the repo and install it:
 
-If you later move from the manual install to the package, clear these first:
+```bash
+mkdir -p ~/build/aorus-lcd
+cp dist/PKGBUILD dist/aorus-lcd.install ~/build/aorus-lcd/
+cd ~/build/aorus-lcd
+makepkg -s
+sudo pacman -U aorus-lcd-0.1.0-1-x86_64.pkg.tar.zst
+sudo systemctl enable --now aorus-lcd
+```
 
-- An existing `/etc/aorus-lcd.toml` makes pacman stop with a file conflict. Move it aside and put it
-  back after installing.
+The package puts the binary in `/usr/bin` and the other files under `/usr/lib`. `/etc/aorus-lcd.toml`
+is a config file that pacman keeps across upgrades. The install message lists the remaining steps.
+
+If you move from the manual install to the package, remove the manual one first:
+
+- An existing `/etc/aorus-lcd.toml` makes pacman stop with a file conflict. Keep a copy, and put your
+  settings back after installing.
 - `/etc/systemd/system/aorus-lcd.service` shadows the packaged unit and still points at
-  `/usr/local/bin`. Remove it and the binary:
+  `/usr/local/bin`.
+- The udev rule, the `modules-load.d` file and the `tmpfiles.d` file in `/etc` have the same names as
+  the packaged ones and would override them.
 
 ```bash
 sudo systemctl disable --now aorus-lcd
-sudo rm /etc/systemd/system/aorus-lcd.service /usr/local/bin/aorus-lcd
+cp /etc/aorus-lcd.toml ~/aorus-lcd.toml.bak
+sudo rm /etc/systemd/system/aorus-lcd.service /usr/local/bin/aorus-lcd /etc/aorus-lcd.toml \
+  /etc/udev/rules.d/99-i2c.rules /etc/modules-load.d/i2c-dev.conf /etc/tmpfiles.d/aorus-lcd.conf
 sudo systemctl daemon-reload
 ```
 
